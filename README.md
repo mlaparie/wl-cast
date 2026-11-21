@@ -12,7 +12,9 @@ I wrote it for my Linux phone (an F(x)tec Pro¹x running Guix and Sway), so I ca
 - `wl-cast-server` serves the page and streams the video and the sound over WebRTC. Touches and keys come back over a data channel and are played on virtual input devices.
 - `wl-cast` starts and stops it: `wl-cast start` asks which screen to stream if you have several and prints the link, `wl-cast stop` ends it.
 
-Also included: `wl-cast-screen` gives the viewer a screen of its own at its size, and `wl-cast-cert` gets a real certificate for browsers that refuse local addresses. `examples/car-bluetooth` starts the hotspot and the stream automatically when the car connects to Bluetooth.
+Two helpers come with it. `wl-cast-screen` streams a screen made at the size of the viewer's window instead of your own (`wl-cast start -s client`), so the picture fills a car's display for instance, and it follows when the window is resized. `wl-cast-cert` gets a real certificate for a domain of yours, for browsers that refuse local addresses and self-signed certificates, like some cars' browsers.
+
+You can add your own scripts around it, _e.g._, `examples/car-bluetooth` starts the hotspot and the stream when the car connects over Bluetooth. Copy it to `~/.local/bin`, set the names at its top, and start it from your Sway config (`exec ~/.local/bin/car-bluetooth`).
 
 ## Your own buttons and gestures
 
