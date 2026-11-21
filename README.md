@@ -20,7 +20,7 @@ The page has a few buttons of its own (sound, keyboard, settings). Add yours in 
 
 Everything specific to your host goes in an optional `~/.config/wl-cast/hook` script, see `examples/hook`: keeping the screen awake, Wi-Fi power saving, and your gesture tool on the viewer's touches, so edge swipes work from the stream as they do on the screen for instance.
 
-## Latency
+## Performance
 
 Measured on the Pro¹x (Snapdragon 662, Venus encoder):
 
@@ -30,7 +30,7 @@ Measured on the Pro¹x (Snapdragon 662, Venus encoder):
 | screen to browser, same Wi-Fi | about 70 ms |
 | CPU for capture and encoding | about 4 % of a core |
 | GPU for the conversion to NV12 | about 2.5 % of its time (1600x800, 20 fps); Sway's copy adds nothing measurable |
-| through the screen-cast portal instead | 400 ms and more than a core |
+| for comparison, the usual capture path (xdg-desktop-portal-wlr, PipeWire, GStreamer) | frames 400 ms old, more than a core |
 
 ## Install
 
