@@ -4,10 +4,8 @@
 #   wl-cast start [OPTION...]   start it and print its links
 #   wl-cast stop
 #   wl-cast status              the links, if it runs
-#   wl-cast dim [on|off]        the screen black but still streamed, or
-#                               lit again; no argument: the other one.
-#                               Fails when no stream shows the screen
-#                               (bind it to a key, and blank as usual then)
+#   wl-cast dim [on|off]        with start -d: turn the screen black, or
+#                               light it again (no argument: the other)
 #
 # Options:
 #   -o OUTPUT    the screen to stream (default: asked when there are
@@ -24,10 +22,16 @@
 #   -v WHO       hotspot, lan (default) or wan: who may connect
 #   -w on|off    keep the screen awake while streaming (default on):
 #                through your hook if it does it, else swayidle paused
-#   -d           dim the screen to black once the stream runs
+#   -d           dim instead of blank: a screen turned off is not
+#                captured, so while the stream runs, `wl-cast dim' turns
+#                it black and back instead.  Bind your blanking key (the
+#                power key) to `wl-cast dim || <your blank command>': it
+#                then toggles dim while wl-cast streams this screen, and
+#                blanks as usual otherwise.  The brightness is back when
+#                the stream ends (brightnessctl)
+#   -T           with -d: the screen's own touch input off while dimmed
+#                (a phone in a pocket); the viewer's still works
 #   -h           this help
-#
-# The brightness dimmed is back when the stream ends (brightnessctl).
 #
 # wl-cast-server does the work; this only picks its arguments.
 # wf-recorder is the fallback when wl-cast-capture cannot run.  The
@@ -40,6 +44,8 @@ state=${XDG_STATE_HOME:-$HOME/.local/state}/wl-cast
 pid_file=$rt/wl-cast.pid
 links_file=$rt/wl-cast.links
 dimmed=$rt/wl-cast.dimmed               # the brightness to go back to
+dim_ok=$rt/wl-cast.dim                  # start -d: "dim", or "dim touch" (-T)
+touch_off=$rt/wl-cast.touch-off         # the touch devices turned off
 key_file=$state/key
 
 running() { [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; }
@@ -50,6 +56,7 @@ stop() {
     running && kill -TERM -- "-$(cat "$pid_file")" 2>/dev/null
     rm -f "$pid_file" "$links_file"
     dim off
+    rm -f "$dim_ok"
     # swayidle paused by a server that did not end cleanly.
     [ -f "$rt/wl-cast-idle-stopped" ] && xargs kill -CONT < "$rt/wl-cast-idle-stopped" 2>/dev/null
     rm -f "$rt/wl-cast-idle-stopped"
@@ -62,11 +69,22 @@ dim() {
         off)
             [ -f "$dimmed" ] || return 0
             brightnessctl -q set "$(cat "$dimmed")"
-            rm -f "$dimmed" ;;
+            rm -f "$dimmed"
+            [ -f "$touch_off" ] && while read -r d; do
+                swaymsg "input \"$d\" events enabled" >/dev/null
+            done < "$touch_off"
+            rm -f "$touch_off" ;;
         on)
-            running && [ ! -s "$rt/wl-cast-output" ] || return 1
+            running && [ -f "$dim_ok" ] && [ ! -s "$rt/wl-cast-output" ] || return 1
             [ -f "$dimmed" ] && return 0
-            brightnessctl -m | cut -d, -f3 > "$dimmed" && brightnessctl -q set 0 ;;
+            brightnessctl -m | cut -d, -f3 > "$dimmed" && brightnessctl -q set 0
+            if grep -q touch "$dim_ok"; then
+                swaymsg -t get_inputs -r | jq -r '.[] | select(.type == "touch")
+                    | select(.identifier | test("wl-cast-remote") | not) | .identifier' > "$touch_off"
+                while read -r d; do
+                    swaymsg "input \"$d\" events disabled" >/dev/null
+                done < "$touch_off"
+            fi ;;
         *)
             if [ -f "$dimmed" ]; then dim off; else dim on; fi ;;
     esac
@@ -100,20 +118,20 @@ address() {
 }
 
 start() {
-    addr= port=8081 tls=8443 fps=30 screen=phone approve=off who=lan dark=
+    addr= port=8081 tls=8443 fps=30 screen=phone approve=off who=lan dims=
     key=$(cat "$key_file" 2>/dev/null)
     if [ -z "$key" ]; then
         mkdir -p "$state"
         key=$(LC_ALL=C tr -dc 'a-km-z2-9' < /dev/urandom 2>/dev/null | head -c 5)
         echo "$key" > "$key_file"
     fi
-    while getopts o:a:p:t:k:r:s:A:v:w:dh o; do
+    while getopts o:a:p:t:k:r:s:A:v:w:dTh o; do
         case $o in
             o) WL_CAST_PANEL=$OPTARG ;; a) addr=$OPTARG ;; p) port=$OPTARG ;; t) tls=$OPTARG ;;
             k) key=$OPTARG ;; r) fps=$OPTARG ;; s) screen=$OPTARG ;;
             A) approve=$OPTARG ;; v) who=$OPTARG ;;
             w) [ "$OPTARG" = off ] && export WL_CAST_AWAKE=0 ;;
-            d) dark=1 ;; h) usage; exit ;;
+            d) dims="dim${dims#dim}" ;; T) dims="${dims:-dim} touch" ;; h) usage; exit ;;
             *) usage >&2; exit 2 ;;
         esac
     done
@@ -148,7 +166,7 @@ start() {
     running || { rm -f "$pid_file"; echo "wl-cast: the server did not start" >&2; exit 1; }
     printf 'http://%s:%s/%s\nhttps://%s:%s/%s\n' "$addr" "$port" "${key:+?k=$key}" \
            "$addr" "$tls" "${key:+?k=$key}" | tee "$links_file"
-    [ -n "$dark" ] && dim on
+    case "$dims" in dim*) echo "$dims" > "$dim_ok" ;; esac
     return 0
 }
 
