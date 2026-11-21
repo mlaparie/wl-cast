@@ -4,12 +4,16 @@
 #   wl-cast start [OPTION...]   start it and print its links
 #   wl-cast stop
 #   wl-cast status              the links, if it runs
+#   wl-cast dim [on|off]        the screen black but still streamed, or
+#                               lit again; no argument: the other one.
+#                               Fails when no stream shows the screen
+#                               (bind it to a key, and blank as usual then)
 #
 # Options:
 #   -o OUTPUT    the screen to stream (default: asked when there are
 #                several, in the terminal or by a click with slurp)
-#   -a ADDRESS   the address put in the links (default: the first one other
-#                devices can reach)
+#   -a ADDRESS   the address put in the links (default: the local
+#                network's, on the default route)
 #   -p PORT      HTTP port (8081); -t PORT: HTTPS port (8443)
 #   -k KEY       the key the link carries; -k '' for none.  Default: a random
 #                one, kept between runs so that a bookmark keeps working
@@ -18,6 +22,12 @@
 #                viewer's size) or multi-monitor (a second screen)
 #   -A APPROVE   off, tap (a notification) or fingerprint, for a new viewer
 #   -v WHO       hotspot, lan (default) or wan: who may connect
+#   -w on|off    keep the screen awake while streaming (default on):
+#                through your hook if it does it, else swayidle paused
+#   -d           dim the screen to black once the stream runs
+#   -h           this help
+#
+# The brightness dimmed is back when the stream ends (brightnessctl).
 #
 # wl-cast-server does the work; this only picks its arguments.
 # wf-recorder is the fallback when wl-cast-capture cannot run.  The
@@ -29,13 +39,37 @@ rt=${XDG_RUNTIME_DIR:-/tmp}
 state=${XDG_STATE_HOME:-$HOME/.local/state}/wl-cast
 pid_file=$rt/wl-cast.pid
 links_file=$rt/wl-cast.links
+dimmed=$rt/wl-cast.dimmed               # the brightness to go back to
 key_file=$state/key
 
 running() { [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; }
 
+usage() { awk 'NR > 2 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"; }
+
 stop() {
     running && kill -TERM -- "-$(cat "$pid_file")" 2>/dev/null
     rm -f "$pid_file" "$links_file"
+    dim off
+    # swayidle paused by a server that did not end cleanly.
+    [ -f "$rt/wl-cast-idle-stopped" ] && xargs kill -CONT < "$rt/wl-cast-idle-stopped" 2>/dev/null
+    rm -f "$rt/wl-cast-idle-stopped"
+}
+
+# Dimmed, not blanked: a screen turned off is not captured.  Not when the
+# stream shows a screen of its own (wl-cast-screen): that one goes on.
+dim() {
+    case "${1:-}" in
+        off)
+            [ -f "$dimmed" ] || return 0
+            brightnessctl -q set "$(cat "$dimmed")"
+            rm -f "$dimmed" ;;
+        on)
+            running && [ ! -s "$rt/wl-cast-output" ] || return 1
+            [ -f "$dimmed" ] && return 0
+            brightnessctl -m | cut -d, -f3 > "$dimmed" && brightnessctl -q set 0 ;;
+        *)
+            if [ -f "$dimmed" ]; then dim off; else dim on; fi ;;
+    esac
 }
 
 # The output to stream: -o, WL_CAST_PANEL, the only one, or the one picked.
@@ -66,19 +100,21 @@ address() {
 }
 
 start() {
-    addr= port=8081 tls=8443 fps=30 screen=phone approve=off who=lan
+    addr= port=8081 tls=8443 fps=30 screen=phone approve=off who=lan dark=
     key=$(cat "$key_file" 2>/dev/null)
     if [ -z "$key" ]; then
         mkdir -p "$state"
         key=$(LC_ALL=C tr -dc 'a-km-z2-9' < /dev/urandom 2>/dev/null | head -c 5)
         echo "$key" > "$key_file"
     fi
-    while getopts o:a:p:t:k:r:s:A:v: o; do
+    while getopts o:a:p:t:k:r:s:A:v:w:dh o; do
         case $o in
             o) WL_CAST_PANEL=$OPTARG ;; a) addr=$OPTARG ;; p) port=$OPTARG ;; t) tls=$OPTARG ;;
             k) key=$OPTARG ;; r) fps=$OPTARG ;; s) screen=$OPTARG ;;
             A) approve=$OPTARG ;; v) who=$OPTARG ;;
-            *) exit 2 ;;
+            w) [ "$OPTARG" = off ] && export WL_CAST_AWAKE=0 ;;
+            d) dark=1 ;; h) usage; exit ;;
+            *) usage >&2; exit 2 ;;
         esac
     done
     WL_CAST_PANEL=$(pick_output)
@@ -112,11 +148,15 @@ start() {
     running || { rm -f "$pid_file"; echo "wl-cast: the server did not start" >&2; exit 1; }
     printf 'http://%s:%s/%s\nhttps://%s:%s/%s\n' "$addr" "$port" "${key:+?k=$key}" \
            "$addr" "$tls" "${key:+?k=$key}" | tee "$links_file"
+    [ -n "$dark" ] && dim on
+    return 0
 }
 
 case "${1:-}" in
     start) shift; start "$@" ;;
     stop) stop ;;
     status) running && cat "$links_file" ;;
-    *) sed -n '3,5s/^# *//p' "$0" >&2; exit 2 ;;
+    dim) dim "${2:-}" ;;
+    -h|--help|help) usage ;;
+    *) usage >&2; exit 2 ;;
 esac

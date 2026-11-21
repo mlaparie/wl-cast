@@ -22,6 +22,8 @@ The page has a few buttons of its own (sound, keyboard, settings). Add yours in 
 
 Everything specific to your host goes in an optional `~/.config/wl-cast/hook` script, see `examples/hook`: keeping the screen awake, Wi-Fi power saving, and your gesture tool on the viewer's touches, so edge swipes work from the stream as they do on the screen for instance.
 
+The screen stays awake while streaming (`-w off` to let it blank), through your hook or else by pausing swayidle. A screen turned off is not captured, so `wl-cast dim` turns it black instead, and back: bind it to your power key, falling back to blanking when it fails (no stream). `-d` starts dimmed. The brightness comes back when the stream ends.
+
 ## Performance
 
 Measured on the Pro¹x (Snapdragon 662, Venus encoder), streaming at 960x480 to Chromium on a PC on the same Wi-Fi:
