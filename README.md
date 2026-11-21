@@ -63,7 +63,7 @@ Needs wayland, wayland-protocols, wlr-protocols, mesa (gbm, EGL, GLES 2) and lib
 - Input on other compositors: the virtual devices are fine, but the screen handling uses swaymsg.
 - Other encoders than Venus: tested on that one only.
 
-## AI assistance
+## Disclaimer
 
 This project used AI assistance. I am not particularly proud of it, but none of this would have been possible if I were coding it alone. Everything was however directed and tested by a human, with some organic code writing and review as well. Expect rough edges still: this was written and tested on a mobile Linux device only. PRs are welcome.
 
