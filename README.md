@@ -57,7 +57,7 @@ Needs wayland, wayland-protocols, wlr-protocols, mesa (gbm, EGL, GLES 2) and lib
 
 ## AI assistance
 
-Most of the code was written by an AI coding assistant (Claude), under my direction: I decided what to build and tested the results on my phone and in my car. Expect rough edges; reports are welcome.
+AI assistance was significant in writing this project. I decided what to build and tested the results on my phone and in my car. Expect rough edges; reports are welcome.
 
 ## License
 
