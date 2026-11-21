@@ -219,6 +219,11 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
 #lockmsg{position:fixed;left:50%;top:40%;transform:translate(-50%,-50%);display:none;
   max-width:80%;padding:12px 16px;background:#000c;color:#fff;font:16px sans-serif;
   text-align:center;pointer-events:none;z-index:5}
+#lockkb{pointer-events:auto;margin-top:10px;user-select:none}
+#lockkb div{display:flex;justify-content:center;gap:4px;margin:4px 0}
+#lockkb button{min-width:2.2em;padding:10px 6px;font:16px monospace;background:#333;
+  color:#fff;border:1px solid #666;border-radius:4px}
+#lockdots{font:20px monospace;letter-spacing:4px;min-height:1.2em}
 #note{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);display:none;
   z-index:3;background:#222;color:#ff0;font:16px monospace;padding:10px 14px;
   max-width:80%}
@@ -260,7 +265,8 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
 <option>1280</option><option>960</option></select> px, long side</label>
 <button id="sy">RESYNC</button></div>
 <div id="note"></div><div id="lockmsg">The phone is locked: the picture stays still until it is unlocked.<br>
-Type its password and Enter (it goes to the lock screen), or use a finger on the phone.</div><div id="info"><div id="clock"></div><pre id="it"></pre><canvas id="tc" width="240" height="40"></canvas></div>
+Type its password and Enter (it goes to the lock screen), or use a finger on the phone.
+<div id="lockkb"><div id="lockdots"></div></div></div><div id="info"><div id="clock"></div><pre id="it"></pre><canvas id="tc" width="240" height="40"></canvas></div>
 <div id="gate"><div>The key shown on the phone</div>
 <input id="gk" autocapitalize="off" autocomplete="off" autocorrect="off"
  spellcheck="false" maxlength="16"><button id="go">OK</button><div id="gm"></div></div>
@@ -344,6 +350,41 @@ function send(o) {
   if (c && c.readyState === "open") c.send(JSON.stringify(o));
 }
 addEventListener("resize", () => log({ev: "resize", w: innerWidth, h: innerHeight}));
+
+// A keyboard of the page's own under the lock message, for a viewer without
+// a keyboard: the phone's on-screen keyboard cannot show over the lock
+// screen, which Sway keeps out of the capture.  Each key goes to the lock
+// screen; dots count what was typed, nothing else is kept.
+(() => {
+  const kb = document.getElementById("lockkb"), dots = document.getElementById("lockdots");
+  let shift = false, typed = 0;
+  const rows = ["1234567890", "qwertyuiop", "asdfghjkl", "^zxcvbnm<", "-./ E"];
+  const code = c => /[0-9]/.test(c) ? "Digit" + c : /[a-z]/.test(c) ? "Key" + c.toUpperCase()
+    : {"<": "Backspace", "E": "Enter", " ": "Space", "-": "Minus", ".": "Period", "/": "Slash"}[c];
+  const label = c => ({"^": "\\u21e7", "<": "\\u232b", "E": "Enter", " ": "space"}[c]
+    || (shift && /[a-z]/.test(c) ? c.toUpperCase() : c));
+  const draw = () => {
+    kb.querySelectorAll("div.r").forEach(r => r.remove());
+    for (const row of rows) {
+      const r = document.createElement("div"); r.className = "r";
+      for (const c of row) {
+        const b = document.createElement("button");
+        b.textContent = label(c);
+        b.onclick = e => {
+          e.stopPropagation();
+          if (c === "^") { shift = !shift; draw(); return; }
+          send({t: "key", code: code(c), shift: shift && /[a-z]/.test(c), ctrl: false, alt: false});
+          typed = c === "<" ? Math.max(0, typed - 1) : c === "E" ? 0 : typed + 1;
+          dots.textContent = "\\u2022".repeat(typed);
+          if (shift) { shift = false; draw(); }
+        };
+        r.appendChild(b);
+      }
+      kb.appendChild(r);
+    }
+  };
+  draw();
+})();
 
 // The element showing the picture, and the picture's size: the canvas in
 // CANVAS and DIRECT, which draws decoded frames straight onto it.
@@ -1012,7 +1053,7 @@ function mouseMove(e) {
 let triple = false;
 function press(e) {
   if (captured) return;
-  if (e.target.closest && e.target.closest("#bar, #set, #gate")) return;
+  if (e.target.closest && e.target.closest("#bar, #set, #gate, #lockkb")) return;
   e.preventDefault();
   if (e.pointerType === "mouse" && cfg.input === "mouse") {
     const n = norm(e);
@@ -1070,7 +1111,7 @@ function press(e) {
 function move(e) {
   if (captured) return;
   if (e.pointerType === "mouse" && cfg.input === "mouse") {
-    if (!(e.target.closest && e.target.closest("#bar, #set, #gate, #info"))) mouseMove(e);
+    if (!(e.target.closest && e.target.closest("#bar, #set, #gate, #lockkb, #info"))) mouseMove(e);
     return;
   }
   if (!active.has(e.pointerId)) return;
@@ -1106,7 +1147,7 @@ function move(e) {
 }
 function release(e) {
   if (e.pointerType === "mouse" && cfg.input === "mouse" && !captured && e.type === "pointerup") {
-    if (e.target.closest && e.target.closest("#bar, #set, #gate")) return;
+    if (e.target.closest && e.target.closest("#bar, #set, #gate, #lockkb")) return;
     if (e.button === 0) send({t: "up"});
     else send({t: "rbtn", b: MOUSE[e.button] || "left", d: 0});
     return;
@@ -1207,7 +1248,7 @@ document.addEventListener("mousemove", e => {
   if (holdTimer && (holdMoved += Math.abs(e.movementX) + Math.abs(e.movementY)) > 30) holdEnd();
 });
 // The buttons' own: a touch on them makes mouse events too.
-const onButtons = e => e.target.closest && e.target.closest("#bar, #set, #gate");
+const onButtons = e => e.target.closest && e.target.closest("#bar, #set, #gate, #lockkb");
 document.addEventListener("mousedown", e => {
   if (!captured || onButtons(e)) return;
   e.preventDefault();
