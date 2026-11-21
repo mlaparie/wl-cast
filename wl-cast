@@ -55,10 +55,14 @@ pick_output() {
     fi
 }
 
-# Not USB, loopback, containers or bridges: only the host reaches those.
+# The one on the default route (the local network's, not a VPN's), else
+# any but USB, loopback, containers, bridges and VPNs: only the host, or
+# its VPN's peers, reach those.
 address() {
-    ip -4 -o addr show scope global |
-        awk '$2 !~ /^(usb|lo|waydroid|veth|docker|br-)/ { sub("/.*", "", $4); print $4; exit }'
+    ip -4 route get 1.1.1.1 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }' |
+        grep . ||
+        ip -4 -o addr show scope global |
+        awk '$2 !~ /^(usb|lo|waydroid|veth|docker|br-|tailscale|wg|tun)/ { sub("/.*", "", $4); print $4; exit }'
 }
 
 start() {
