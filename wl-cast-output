@@ -1,0 +1,11 @@
+#!/bin/sh
+# wl-cast-output — the output the screen-cast portal captures, for
+# xdg-desktop-portal-wlr's chooser (chooser_cmd, system/mobile.scm): the
+# interactive stream's own Sway output while it has one (its name in
+# $XDG_RUNTIME_DIR/wl-cast-output, written by wl-cast-server),
+# else the panel.  No question asked: the stream opens the portal
+# unattended.
+#
+# State: used on the phone (2026-11-19).
+name=$(cat "${XDG_RUNTIME_DIR:-/tmp}/wl-cast-output" 2>/dev/null)
+echo "Monitor: ${name:-${WL_CAST_PANEL:-DSI-1}}"

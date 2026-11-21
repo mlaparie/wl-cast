@@ -1,0 +1,3 @@
+capture/wl-cast-capture
+capture/*-protocol.c
+capture/*-client-protocol.h

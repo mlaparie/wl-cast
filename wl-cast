@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# wl-cast — start and stop the browser stream of this screen.
+#
+#   wl-cast start [OPTION...]   start it and print its links
+#   wl-cast stop
+#   wl-cast status              the links, if it runs
+#
+# Options:
+#   -a ADDRESS   the address put in the links (default: the first one other
+#                devices can reach)
+#   -p PORT      HTTP port (8081); -t PORT: HTTPS port (8443)
+#   -k KEY       the key the link carries; -k '' for none.  Default: a random
+#                one, kept between runs so that a bookmark keeps working
+#   -r FPS       frame rate (30)
+#   -s SCREEN    phone (the screen as it is), client (a screen of the
+#                viewer's size) or multi-monitor (a second screen)
+#   -A APPROVE   off, tap (a notification) or fingerprint, for a new viewer
+#   -v WHO       hotspot, lan (default) or wan: who may connect
+#
+# wl-cast-server does the work; this only picks its arguments.  The screen
+# is WL_CAST_PANEL, else the first active output.  wf-recorder is the
+# fallback when wl-cast-capture cannot run.
+set -u
+
+rt=${XDG_RUNTIME_DIR:-/tmp}
+state=${XDG_STATE_HOME:-$HOME/.local/state}/wl-cast
+pid_file=$rt/wl-cast.pid
+links_file=$rt/wl-cast.links
+key_file=$state/key
+
+running() { [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; }
+
+stop() {
+    running && kill -TERM -- "-$(cat "$pid_file")" 2>/dev/null
+    rm -f "$pid_file" "$links_file"
+}
+
+# Not USB, loopback, containers or bridges: only the host reaches those.
+address() {
+    ip -4 -o addr show scope global |
+        awk '$2 !~ /^(usb|lo|waydroid|veth|docker|br-)/ { sub("/.*", "", $4); print $4; exit }'
+}
+
+start() {
+    addr= port=8081 tls=8443 fps=30 screen=phone approve=off who=lan
+    key=$(cat "$key_file" 2>/dev/null)
+    if [ -z "$key" ]; then
+        mkdir -p "$state"
+        key=$(LC_ALL=C tr -dc 'a-km-z2-9' < /dev/urandom 2>/dev/null | head -c 5)
+        echo "$key" > "$key_file"
+    fi
+    while getopts a:p:t:k:r:s:A:v: o; do
+        case $o in
+            a) addr=$OPTARG ;; p) port=$OPTARG ;; t) tls=$OPTARG ;;
+            k) key=$OPTARG ;; r) fps=$OPTARG ;; s) screen=$OPTARG ;;
+            A) approve=$OPTARG ;; v) who=$OPTARG ;;
+            *) exit 2 ;;
+        esac
+    done
+    addr=${addr:-$(address)}
+    [ -n "$addr" ] || { echo "wl-cast: no network" >&2; exit 1; }
+
+    # The output's size in pixels, 1920 at most on its long side, even.
+    read -r turn w h < <(swaymsg -t get_outputs -r | jq -r --arg o "${WL_CAST_PANEL:-}" '
+        [.[] | select(.active and ($o == "" or .name == $o))][0]
+        | "\(.transform) \(.rect.width * .scale) \(.rect.height * .scale)"')
+    read -r w h < <(awk -v w="$w" -v h="$h" 'BEGIN {
+        m = w > h ? w : h; f = m > 1920 ? 1920 / m : 1
+        w = int(w * f + 0.5); h = int(h * f + 0.5); print w - w % 2, h - h % 2 }')
+    # wf-recorder scales before it turns the picture.
+    case "$turn" in *90|*270) filter="scale=$h:$w" ;; *) filter="scale=$w:$h" ;; esac
+
+    stop
+    setsid wl-cast-server --raw "${w}x$h@$fps" ${key:+--key "$key"} --tls "$tls" \
+        --screen "$screen" --approve "$approve" --visibility "$who" \
+        --portal "$turn" --interactive "$port" \
+        wf-recorder -D -r "$fps" -F "$filter" -m rawvideo -c rawvideo -x nv12 -f pipe:1 -- \
+        wf-recorder -D -r "$fps" -m ivf -c libvpx -x yuv420p -p deadline=realtime \
+            -p cpu-used=8 -p threads=4 -p b=4000000 -p g="$fps" -f pipe:1 \
+        >/dev/null 2>&1 </dev/null &
+    echo $! > "$pid_file"
+    sleep 1
+    running || { rm -f "$pid_file"; echo "wl-cast: the server did not start" >&2; exit 1; }
+    printf 'http://%s:%s/%s\nhttps://%s:%s/%s\n' "$addr" "$port" "${key:+?k=$key}" \
+           "$addr" "$tls" "${key:+?k=$key}" | tee "$links_file"
+}
+
+case "${1:-}" in
+    start) shift; start "$@" ;;
+    stop) stop ;;
+    status) running && cat "$links_file" ;;
+    *) sed -n '3,5s/^# *//p' "$0" >&2; exit 2 ;;
+esac

@@ -1,0 +1,4004 @@
+#!/usr/bin/env python3
+"""wl-cast-server [--raw WxH@FPS] [--key KEY] [--tls PORT] [--screen phone|client|multi-monitor] [--approve off|tap|fingerprint] [--portal TRANSFORM] [--interactive] PORT COMMAND... -- VP8-COMMAND... -- serve by WebRTC.
+wl-cast-server udp HOST PORT WxH@FPS COMMAND... -- send MPEG-TS by UDP.
+
+With --interactive (the interactive stream, README.md), the
+page also sends touches and keys back over a WebRTC data channel, which
+virtual devices (uinput) play on the Pro1x: by default a multi-touch screen,
+so apps get touches as from the Pro1x's own; in mouse mode a pointer (a tap
+clicks, a drag drags, a long press right-clicks, two fingers scroll).  Its
+buttons open the browser's keyboard, the Pro1x's own (stevia, for special
+keys), its quick actions, launcher and window switcher.  The page can draw the video
+on a canvas instead of a video element, shows what the browser reports
+(screen size, codec, frames, delay), and logs it and the events it gets to
+~/.local/state/wl-cast/stream.log, for testing a car's browser.
+Its SET panel and its modes, kept on the phone
+(~/.local/state/wl-cast/stream.json) and by the browser: the buffer before showing (smoother but
+later), the sound's offset against the picture, a resync, and the H.264 bit
+rate, changed on the phone's encoder while it runs.  The last button folds
+the others away.
+
+The sound is what the phone plays (the default output's monitor), as Opus.
+A browser starts the page muted: the first touch turns the sound on, or the
+SOUND button.
+
+COMMAND writes H.264 (constrained baseline) to its standard output.  With a size
+and rate it writes raw NV12 frames instead, for the hardware H.264 encoder.
+VP8-COMMAND writes VP8 in IVF.  One of them
+runs while a viewer is connected.  A browser gets a page from
+http://ADDRESS:PORT/ and plays the video with no application; one viewer at a
+time, and a new one replaces the last.  With --key, every request but the
+page's needs ?k=KEY, else 403: the page asks for the key in a box (or takes
+it from a link with ?k=), so on a shared network only who has the key sees
+the screen and acts on it.
+
+The page tries H.264, which costs the phone less, then VP8 if no picture comes:
+LibreWolf lists H.264 but needs media.gmp-gmpopenh264.enabled to decode it, and
+CEF (Nyxt) has no decoder.  VP8 is encoded in software: this encoder has no VP8.
+
+The Pro1x makes the WebRTC offer and the browser answers, both by plain HTTP.
+This way the browser takes the payload type GStreamer chose, and no signalling
+server is needed.  ICE uses local addresses only.
+
+State: VP8 played in a browser (author, 2026-11-10).  The hardware path encodes
+real screen frames on the phone; not yet seen in a browser.
+"""
+
+import base64
+import hashlib
+import hmac
+import queue
+import json
+import select
+import shutil
+import re
+import os
+import signal
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import socket
+
+import gi
+
+gi.require_version("Gst", "1.0")
+gi.require_version("GstSdp", "1.0")
+gi.require_version("GstVideo", "1.0")
+gi.require_version("GstWebRTC", "1.0")
+from gi.repository import GLib, Gst, GstSdp, GstVideo, GstWebRTC  # noqa: E402
+
+
+def first_output():
+    """The first active Sway output: the screen streamed by default."""
+    try:
+        out = json.loads(subprocess.run(["swaymsg", "-r", "-t", "get_outputs"],
+                                        capture_output=True, timeout=5).stdout)
+        return next(o["name"] for o in out if o.get("active"))
+    except Exception:
+        return "DSI-1"
+
+
+# The panel: WL_CAST_PANEL, else the first active output.
+PANEL = os.environ.get("WL_CAST_PANEL") or first_output()
+
+PAGE = b"""<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pro1x screen</title>
+<style>html,body{margin:0;height:100%;background:#000}
+video{width:100%;height:100%;object-fit:contain}</style>
+<video id="v" autoplay muted playsinline controls></video>
+<script>
+const pc = new RTCPeerConnection();
+pc.ontrack = e => {
+  document.getElementById("v").srcObject =
+    e.streams[0] || new MediaStream([e.track]);
+};
+// VP8 for this tab only (never in the address, where browsers kept it):
+// a browser can list H.264 and have no decoder.  Judged 8 s after the
+// connection is up, not after the request: an approval on the phone and a
+// relay (Funnel) delayed the first frame past the old 5 s.
+const keptCodec = () => { try { return sessionStorage.getItem("codec"); } catch (x) { return null; } };
+function vp8IfNothing(pc, reload) {
+  let armed = false;
+  const check = () => {
+    if (armed || pc.connectionState !== "connected") return;
+    armed = true;
+    setTimeout(async () => {
+      let decoded = 0;
+      (await pc.getStats()).forEach(r => {
+        if (r.type === "inbound-rtp" && r.kind === "video") decoded = r.framesDecoded;
+      });
+      if (decoded) return;
+      try { sessionStorage.setItem("codec", "vp8"); } catch (x) {}
+      reload();
+    }, 8000);
+  };
+  pc.addEventListener("connectionstatechange", check);
+  check();
+}
+(async () => {
+  const codecs = RTCRtpReceiver.getCapabilities("video").codecs;
+  const codec = new URLSearchParams(location.search).get("codec") || keptCodec()
+    || (codecs.some(c => /h264/i.test(c.mimeType)) ? "h264" : "vp8");
+  const k = new URLSearchParams(location.search).get("k");
+  const withK = path => k ? path + (path.includes("?") ? "&" : "?") + "k=" + encodeURIComponent(k) : path;
+  const offer = await (await fetch(withK("/offer?codec=" + codec))).text();
+  await pc.setRemoteDescription({type: "offer", sdp: offer});
+  await pc.setLocalDescription(await pc.createAnswer());
+  // All the local addresses go in the answer: there is no later exchange.
+  await new Promise(done => {
+    if (pc.iceGatheringState === "complete") return done();
+    pc.onicegatheringstatechange = () =>
+      pc.iceGatheringState === "complete" && done();
+    setTimeout(done, 2000);
+  });
+  await fetch(withK("/answer"), {method: "POST", body: pc.localDescription.sdp});
+  if (codec === "h264") vp8IfNothing(pc, () => location.reload());
+})();
+</script>
+"""
+
+
+INTERACTIVE_PAGE = b"""<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Pro1x</title>
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none;
+  -webkit-user-select:none;user-select:none}
+#v,#c{position:absolute;left:0;top:0;width:100%;height:100%;object-fit:contain;
+  touch-action:none}
+#c{display:none}
+#bar{position:fixed;top:4px;right:4px;display:flex;flex-wrap:wrap;justify-content:flex-end;
+  gap:3px;opacity:.6;z-index:3;max-width:calc(100vw - 8px)}
+#bar button{font:12px monospace;background:#222;color:#eee;border:1px solid #555;
+  border-radius:0;padding:4px 7px}
+#bar.folded .x{display:none}
+#info{position:fixed;left:6px;top:6px;font:14px monospace;color:#eee;
+  background:rgba(0,0,0,.75);padding:8px;display:none;z-index:1}
+#info pre{margin:0;font:inherit}
+#lockmsg{position:fixed;left:50%;top:40%;transform:translate(-50%,-50%);display:none;
+  max-width:80%;padding:12px 16px;background:#000c;color:#fff;font:16px sans-serif;
+  text-align:center;pointer-events:none;z-index:5}
+#note{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);display:none;
+  z-index:3;background:#222;color:#ff0;font:16px monospace;padding:10px 14px;
+  max-width:80%}
+#set{position:fixed;right:6px;top:64px;font:16px monospace;color:#eee;z-index:2;
+  background:rgba(0,0,0,.8);padding:10px;display:none}
+#set label{display:block;margin:8px 0;white-space:pre}
+#set input[type=range]{width:220px;vertical-align:middle}
+#set .h{margin-top:12px;opacity:.6;font-size:13px}
+#set button{font:16px monospace;background:#222;color:#eee;border:1px solid #555;
+  border-radius:0;padding:8px 12px;margin-top:8px}
+#k{position:fixed;left:0;bottom:0;width:1px;height:1px;opacity:0;border:0}
+#clock{font:bold 16px monospace;color:#ff0;margin-bottom:4px}
+#gate{position:fixed;left:50%;top:40%;transform:translate(-50%,-50%);display:none;
+  z-index:3;background:#222;color:#eee;font:20px monospace;padding:16px;
+  text-align:center}
+#gate input{font:24px monospace;width:8em;margin:10px}
+#gate button{font:20px monospace;padding:8px 16px}
+</style>
+<video id="v" autoplay muted playsinline></video><canvas id="c"></canvas>
+<div id="bar"><button class="x" id="bw">WIN</button><button class="x" id="bq">QA</button>
+<button class="x" id="ba">APPS</button><button class="x" id="bo">OSK</button>
+<button class="x" id="bk">LKB</button><button class="x" id="bu">MUTED</button>
+<button class="x" id="bm">VIDEO</button><button class="x" id="bv">HOST</button><button class="x" id="bt">TOUCH</button>
+<button class="x" id="bp">FREE</button><button class="x" id="bs">SET</button>
+<button class="x" id="bi">INFO</button><button class="x" id="bz">PAUSE</button>
+<button class="x" id="bx">STOP</button><button class="x" id="br">RELOAD</button>
+<button id="bc"></button></div>
+<div id="set">
+<div class="h">now</div>
+<label title="the browser's buffer: more is smoother, later">smooth  <input id="ss" type="range" min="0" max="300" step="10"> <span id="ssv"></span> ms</label>
+<label title="above 0 the sound later, below 0 the picture later">a/v     <input id="sa" type="range" min="-500" max="500" step="20"> <span id="sav"></span> ms</label>
+<label title="frames at exactly the fps (games, films); off: only when the screen changes, cooler">constant fps <input id="st" type="checkbox"></label>
+<label title="above it the phone lowers the fps by 5, and raises it 5 C cooler">heat    <input id="sh" type="range" min="0" max="85" step="5"> <span id="shv"></span></label>
+<label title="fewer frames while the viewer loses packets, back up once it stops">adaptive <input id="ad" type="checkbox"></label>
+<label title="power saving delays and loses what the phone sends; off costs battery">wifi    <input id="wp" type="checkbox"> no power saving while streaming</label>
+<div class="h">on apply (restarts the picture)</div>
+<label>rate    <input id="sb" type="range" min="1" max="16" step="1"> <span id="sbv"></span> Mbit/s</label>
+<label title="constant fps needs one the phone keeps up: 20 at 1920, 25 at 1600">fps     <input id="sf" type="range" min="10" max="60" step="5"> <span id="sfv"></span></label>
+<label>size    <select id="sz"><option>1920</option><option>1600</option>
+<option>1280</option><option>960</option></select> px, long side</label>
+<button id="sy">RESYNC</button></div>
+<div id="note"></div><div id="lockmsg">The phone is locked: the picture stays still until it is unlocked.<br>
+Type its password and Enter (it goes to the lock screen), or use a finger on the phone.</div><div id="info"><div id="clock"></div><pre id="it"></pre><canvas id="tc" width="240" height="40"></canvas></div>
+<div id="gate"><div>The key shown on the phone</div>
+<input id="gk" autocapitalize="off" autocomplete="off" autocorrect="off"
+ spellcheck="false" maxlength="16"><button id="go">OK</button><div id="gm"></div></div>
+<input id="k" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false">
+<script>
+const v = document.getElementById("v"), c = document.getElementById("c");
+const ctx = c.getContext("2d"), info = document.getElementById("info");
+const k = document.getElementById("k");
+const P = new URLSearchParams(location.search);
+
+// Kept by the browser, and on the phone (the browser's own storage may be
+// wiped, as a car's can be, and a new address is a new origin).
+const store = {
+  get(name, d) {
+    try { const s = localStorage.getItem("wl-cast-" + name); return s === null ? d : JSON.parse(s); }
+    catch (e) { return d; }
+  },
+  set(name, value) { try { localStorage.setItem("wl-cast-" + name, JSON.stringify(value)); } catch (e) {} }
+};
+// The access key, when the phone asks for one: from the link, else typed in
+// the box, then sent with each request.
+let key = P.get("k") || store.get("key", "");
+// VP8 for this tab only (never in the address, where browsers kept it):
+// a browser can list H.264 and have no decoder.  Judged 8 s after the
+// connection is up, not after the request: an approval on the phone and a
+// relay (Funnel) delayed the first frame past the old 5 s.
+const keptCodec = () => { try { return sessionStorage.getItem("codec"); } catch (x) { return null; } };
+function vp8IfNothing(pc, reload) {
+  let armed = false;
+  const check = () => {
+    if (armed || pc.connectionState !== "connected") return;
+    armed = true;
+    setTimeout(async () => {
+      let decoded = 0;
+      (await pc.getStats()).forEach(r => {
+        if (r.type === "inbound-rtp" && r.kind === "video") decoded = r.framesDecoded;
+      });
+      if (decoded) return;
+      try { sessionStorage.setItem("codec", "vp8"); } catch (x) {}
+      reload();
+    }, 8000);
+  };
+  pc.addEventListener("connectionstatechange", check);
+  check();
+}
+const withKey = path =>
+  key ? path + (path.includes("?") ? "&" : "?") + "k=" + encodeURIComponent(key) : path;
+const cfg = Object.assign({smooth: 50, av: 0, rate: 6, fps: 30, heat: 70, sound: true, input: "touch", steady: true, adaptive: true, wifi_awake: true,
+                           canvas: false, direct: false, folded: false}, store.get("settings", {}));
+if (P.get("mode")) {
+  cfg.canvas = P.get("mode") === "canvas";
+  cfg.direct = P.get("mode") === "direct";
+}
+// Settings kept before the touchpad mode had touch true or false.
+if (cfg.touch === false && !store.get("settings", {}).input) cfg.input = "mouse";
+delete cfg.touch;
+if (["touch", "mouse", "pad"].includes(P.get("input"))) cfg.input = P.get("input");
+let saving = null;
+function save() {
+  store.set("settings", cfg);
+  clearTimeout(saving);
+  saving = setTimeout(() => {
+    try { fetch(withKey("/settings"), {method: "POST", body: JSON.stringify(cfg)}); }
+    catch (e) {}
+  }, 500);
+}
+
+let chan = null, logged = 0;
+const counts = {};
+function log(o) {
+  o.t = Date.now();
+  try { fetch(withKey("/log"), {method: "POST", body: JSON.stringify(o), keepalive: true}); }
+  catch (e) {}
+}
+// Moves (absolute pointer and touch) on the unordered, never-resent "fast"
+// channel: a lost one is outdated by the next.  The rest, reliable.
+let fast = null;
+function send(o) {
+  counts[o.t] = (counts[o.t] || 0) + 1;
+  const c = (o.t === "move" || o.t === "tmove") && fast && fast.readyState === "open" ? fast : chan;
+  if (c && c.readyState === "open") c.send(JSON.stringify(o));
+}
+addEventListener("resize", () => log({ev: "resize", w: innerWidth, h: innerHeight}));
+
+// The element showing the picture, and the picture's size: the canvas in
+// CANVAS and DIRECT, which draws decoded frames straight onto it.
+const shown = () => (cfg.canvas || cfg.direct) ? c : v;
+const picW = () => cfg.direct ? c.width : v.videoWidth;
+const picH = () => cfg.direct ? c.height : v.videoHeight;
+// DIRECT can be used: WebCodecs, and it did not fail in this tab.
+const directOk = () => "VideoDecoder" in window &&
+  (() => { try { return !sessionStorage.getItem("nodirect"); } catch (x) { return true; } })();
+
+// The picture: in the video element, or drawn on a canvas from it.
+function draw() {
+  if (cfg.canvas && !cfg.direct && v.videoWidth) {
+    if (c.width !== v.videoWidth) { c.width = v.videoWidth; c.height = v.videoHeight; }
+    ctx.drawImage(v, 0, 0);
+  }
+  if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(draw);
+  else requestAnimationFrame(draw);
+}
+// Each button shows the mode in use: VIDEO (the video element and its
+// playout buffer), CANVAS (drawn from it), DIRECT (decoded here, drawn at
+// once: the least delay).
+function showMode() {
+  const on = cfg.canvas || cfg.direct;
+  c.style.display = on ? "block" : "none";
+  v.style.opacity = on ? "0" : "1";
+  document.getElementById("bm").textContent = cfg.direct ? "DIRECT" : cfg.canvas ? "CANVAS" : "VIDEO";
+}
+document.getElementById("bm").onclick = async () => {
+  const was = cfg.direct;
+  if (cfg.direct) { cfg.direct = false; cfg.canvas = false; }
+  else if (cfg.canvas) {
+    // Chosen by hand, DIRECT is tried again even where the tab fell back
+    // from it (the mark stays in a reloaded or duplicated tab).
+    cfg.canvas = false;
+    cfg.direct = "VideoDecoder" in window;
+    if (cfg.direct) try { sessionStorage.removeItem("nodirect"); } catch (x) {}
+  }
+  else cfg.canvas = true;
+  save(); showMode(); log({ev: "mode", canvas: cfg.canvas, direct: cfg.direct});
+  // DIRECT in or out: a new connection, the phone sending the other way.
+  if (cfg.direct !== was) {
+    try { await fetch(withKey("/settings"), {method: "POST", body: JSON.stringify(cfg)}); } catch (e) {}
+    location.reload();
+  }
+};
+
+// DIRECT: the encoder's access units from the phone in the "video" data
+// channel, in chunks (frame number, index, count, keyframe flag), decoded
+// by WebCodecs and drawn as each comes out, without the browser's playout
+// buffer.  Behind (the decoder holding more than two), frames are skipped
+// to the next keyframe, asked for at once: the newest frame wins.
+let decoder = null, dframes = 0, dskipped = 0, derrors = 0, needKey = true;
+let askedKey = 0, dkeys = 0, behindSince = 0;
+// How old each frame is when drawn: from leaving the phone's encoder
+// (its clock and this one both set by NTP), and the encoder's own delay.
+const sentAt = new Map();
+let ageSum = 0, ageN = 0, encSum = 0, encN = 0;
+const parts = {seq: -1, got: 0, n: 0, key: false, chunks: []};
+function newDecoder() {
+  if (decoder) try { decoder.close(); } catch (e) {}
+  decoder = new VideoDecoder({
+    output: f => {
+      if (c.width !== f.displayWidth || c.height !== f.displayHeight) {
+        c.width = f.displayWidth; c.height = f.displayHeight;
+      }
+      ctx.drawImage(f, 0, 0);
+      const sent = sentAt.get(f.timestamp);
+      if (sent !== undefined) {
+        sentAt.delete(f.timestamp);
+        ageSum += Date.now() - sent; ageN++;
+      }
+      f.close();
+      dframes++;
+    },
+    error: e => {
+      log({ev: "decoder-error", err: String(e)});
+      // Not decodable here: VIDEO for this tab.
+      if (++derrors > 3) {
+        try { sessionStorage.setItem("nodirect", "1"); } catch (x) {}
+        location.reload();
+        return;
+      }
+      needKey = true;
+      send({t: "keyframe"});
+      setTimeout(newDecoder, 0);
+    }
+  });
+  // The phone's encoder: H.264 constrained baseline, level 4, Annex B.
+  // Its colours: BT.709, limited range, as wl-cast-capture and the GPU
+  // stage write them; the stream does not say (Venus writes no colour
+  // information), and Chromium's guess looked wrong (author, 2026-11-20).
+  decoder.configure({codec: "avc1.42c028", optimizeForLatency: true,
+                     colorSpace: {primaries: "bt709", transfer: "bt709",
+                                  matrix: "bt709", fullRange: false}});
+}
+function onVideo(m) {
+  if (!onVideo.seen) { onVideo.seen = true; log({ev: "video-first", bytes: m.data.byteLength}); }
+  const d = new DataView(m.data);
+  const seq = d.getUint32(0), i = d.getUint16(4), n = d.getUint16(6), key = d.getUint8(8) === 1;
+  const sent = Number(d.getBigUint64(9)), enc = d.getUint16(17);
+  if (seq !== parts.seq) {
+    parts.seq = seq; parts.got = 0; parts.n = n; parts.key = key; parts.chunks = new Array(n);
+    parts.sent = sent; encSum += enc; encN++;
+  }
+  parts.chunks[i] = new Uint8Array(m.data, 19);
+  if (++parts.got < parts.n) return;
+  // Behind: more than 2 frames waiting in the decoder for 300 ms, or 8.
+  // Firefox's decoder holds a few as it works, and skipping at once at 3
+  // cut it to 8 fps (2026-11-20); Chromium's never holds that many.
+  const q = decoder.decodeQueueSize, now0 = performance.now();
+  if (q > 2) { if (!behindSince) behindSince = now0; } else behindSince = 0;
+  const behind = q > 8 || (behindSince && now0 - behindSince > 300);
+  if (!parts.key && (needKey || behind)) {
+    needKey = true;
+    // Asked again every second while waiting: one request, dropped by the
+    // phone's limit, left the picture frozen until a reload (2026-11-20).
+    const now = performance.now();
+    if (now - askedKey > 1000) { askedKey = now; send({t: "keyframe"}); }
+    dskipped++;
+    return;
+  }
+  if (parts.key) { needKey = false; dkeys++; }
+  const data = new Uint8Array(parts.chunks.reduce((a, b) => a + b.length, 0));
+  let at = 0;
+  for (const part of parts.chunks) { data.set(part, at); at += part.length; }
+  const ts = Math.round(performance.now() * 1000);
+  sentAt.set(ts, parts.sent);
+  if (sentAt.size > 120) sentAt.delete(sentAt.keys().next().value);
+  decoder.decode(new EncodedVideoChunk({type: parts.key ? "key" : "delta", timestamp: ts, data}));
+}
+// INFO: what the browser reports, and this computer's clock to the
+// millisecond: beside a clock on the phone's screen, a screenshot shows the
+// delay (both clocks set by NTP).
+const clock = document.getElementById("clock");
+function tick() {
+  if (info.style.display !== "block") return;
+  const d = new Date();
+  clock.textContent = d.toTimeString().slice(0, 8) + "." +
+    String(d.getMilliseconds()).padStart(3, "0");
+  requestAnimationFrame(tick);
+}
+document.getElementById("bi").onclick = () => {
+  const on = info.style.display !== "block";
+  info.style.display = on ? "block" : "none";
+  if (on) { tick(); drawTemps(); }
+};
+document.getElementById("br").onclick = () => location.reload();
+// PAUSE: the phone sends nothing and its encoder idles (cooler); PLAY:
+// back, from a new keyframe.  STOP ends the stream on the phone; the page
+// waits for a new one.
+let paused = false;
+const bz = document.getElementById("bz");
+bz.onclick = () => {
+  paused = !paused;
+  send({t: paused ? "pause" : "play"});
+  bz.textContent = paused ? "PLAY" : "PAUSE";
+};
+document.getElementById("bx").onclick = () => {
+  if (!confirm("Stop the stream on the phone?")) return;
+  // Logged: a Stop did not reach the phone (2026-11-20).
+  log({ev: "stop", channel: chan ? chan.readyState : "none"});
+  send({t: "stop"});
+  note("Stopped on the phone");
+};
+document.getElementById("bk").onclick = () => { k.focus(); log({ev: "keys-button"}); };
+// The screen mode: HOST (the phone's own), CLIENT (the phone at this
+// window's shape), MULTI (a second display).  Each press steps it; the
+// phone switches 2 s after the last press (author: rapid presses).
+const bv = document.getElementById("bv");
+const SCREENS = ["phone", "client", "multi-monitor"];
+const SCREEN_LABEL = {phone: "HOST", client: "CLIENT", "multi-monitor": "MULTI"};
+let screenWanted = null, screenTimer = null;
+function showScreen() {
+  bv.textContent = SCREEN_LABEL[screenWanted || phone.screen_mode || "phone"] || "HOST";
+}
+bv.onclick = () => {
+  const now = screenWanted || phone.screen_mode || "phone";
+  screenWanted = SCREENS[(SCREENS.indexOf(now) + 1) % SCREENS.length];
+  showScreen();
+  clearTimeout(screenTimer);
+  screenTimer = setTimeout(async () => {
+    const mode = screenWanted;
+    if (mode === (phone.screen_mode || "phone")) { screenWanted = null; return; }
+    log({ev: "screen-mode", mode});
+    note("Switching the screen mode on the phone\\u2026");
+    try { await fetch(withKey("/screen?mode=" + encodeURIComponent(mode)), {method: "POST"}); } catch (e) {}
+    setTimeout(reloadWhenUp, 1500);
+  }, 2000);
+};
+const bar = document.getElementById("bar"), bc = document.getElementById("bc");
+function showFold() {
+  bar.classList.toggle("folded", cfg.folded);
+  bc.textContent = cfg.folded ? "\\u2261" : "\\u00d7";
+}
+bc.onclick = () => { cfg.folded = !cfg.folded; save(); showFold(); };
+const set = document.getElementById("set");
+document.getElementById("bs").onclick = () =>
+  set.style.display = set.style.display === "block" ? "none" : "block";
+
+// The browser's buffer before showing: more is smoother and later.  The
+// a/v offset buffers one of the two longer.
+let vrx = null, arx = null;
+function target(r, ms) {
+  if (!r) return;
+  try { r.jitterBufferTarget = ms; } catch (x) {}
+  try { r.playoutDelayHint = ms / 1000; } catch (x) {}
+}
+function applyDelay() {
+  target(vrx, cfg.smooth + Math.max(0, -cfg.av));
+  target(arx, cfg.smooth + Math.max(0, cfg.av));
+}
+const sliders = [["ss", "smooth", applyDelay], ["sa", "av", applyDelay]];
+// Rate, fps and size restart the phone's capture: kept here until APPLY,
+// which sends them together (one restart), after the other settings are saved.
+const pending = {};
+function showPending() {
+  sy.textContent = Object.keys(pending).length ? "APPLY & RESYNC" : "RESYNC";
+}
+function showSliders() {
+  for (const [id, name] of sliders) {
+    document.getElementById(id).value = cfg[name];
+    document.getElementById(id + "v").textContent = cfg[name];
+  }
+}
+for (const [id, name, after] of sliders) {
+  const input = document.getElementById(id);
+  input.oninput = () => {
+    cfg[name] = Number(input.value);
+    document.getElementById(id + "v").textContent = cfg[name];
+    after();
+  };
+  input.onchange = () => { save(); log({ev: "setting", name, value: cfg[name]}); };
+}
+// Resync: the buffers emptied, then set again; the button says when done.
+// With changes waiting, they go first and the page connects again.
+const sy = document.getElementById("sy");
+sy.onclick = async () => {
+  if (Object.keys(pending).length) {
+    if (pending.mbps) cfg.rate = pending.mbps;
+    if (pending.fps) cfg.fps = pending.fps;
+    store.set("settings", cfg);
+    clearTimeout(saving);
+    sy.textContent = "APPLYING\\u2026";
+    const q = Object.entries(pending).map(([n, x]) => n + "=" + x).join("&");
+    log({ev: "apply", q});
+    try {
+      await fetch(withKey("/settings"), {method: "POST", body: JSON.stringify(cfg)});
+      await fetch(withKey("/apply?" + q), {method: "POST"});
+    } catch (e) {}
+    setTimeout(reloadWhenUp, 1000);
+    return;
+  }
+  target(vrx, 0); target(arx, 0);
+  setTimeout(() => {
+    applyDelay();
+    sy.textContent = (vrx || arx) ? "RESYNCED \\u2713" : "NOTHING TO SYNC";
+    setTimeout(() => sy.textContent = "RESYNC", 2000);
+  }, 300);
+  log({ev: "resync"});
+};
+// Sound: browsers start a page muted; the first touch turns it on when the
+// sound was left on.
+const bu = document.getElementById("bu");
+function showSound() { bu.textContent = v.muted ? "MUTED" : "SOUND"; }
+function sound(on) {
+  v.muted = !on;
+  v.play().catch(() => {});
+  showSound();
+}
+bu.onclick = () => { cfg.sound = v.muted; save(); sound(cfg.sound); };
+let touched = false;
+addEventListener("pointerdown", e => {
+  if (!touched && e.target !== bu && cfg.sound && v.muted) sound(true);
+  touched = true;
+}, {capture: true});
+// The Pro1x's own menus and on-screen keyboard (special keys), on its screen.
+for (const [id, name] of [["bq", "quickactions"], ["ba", "launcher"],
+                          ["bw", "windowswitcher"], ["bo", "osk"]])
+  document.getElementById(id).onclick = () => send({t: "action", name});
+// The input mode, shown as in use: TOUCH, then MOUSE, then PAD.
+const MODES = ["touch", "mouse", "pad"];
+function showInput() { document.getElementById("bt").textContent = cfg.input.toUpperCase(); }
+document.getElementById("bt").onclick = () => {
+  cfg.input = MODES[(MODES.indexOf(cfg.input) + 1) % MODES.length];
+  save(); showInput(); log({ev: "input-mode", input: cfg.input});
+};
+// The capture rate is the phone's: shown from its status, and a change
+// makes it restart the capture, then this page connects again.
+const sf = document.getElementById("sf"), sfv = document.getElementById("sfv");
+function showFps() { sf.value = cfg.fps; sfv.textContent = cfg.fps; }
+sf.oninput = () => sfv.textContent = sf.value;
+sf.onchange = () => { pending.fps = Number(sf.value); showPending(); };
+const sb = document.getElementById("sb"), sbv = document.getElementById("sbv");
+sb.oninput = () => sbv.textContent = sb.value;
+sb.onchange = () => { pending.mbps = Number(sb.value); showPending(); };
+// The heat limit: kept with the settings on the phone, which acts on it.
+const sh = document.getElementById("sh"), shv = document.getElementById("shv");
+function showHeat() {
+  sh.value = cfg.heat < 50 ? 0 : cfg.heat;
+  shv.textContent = cfg.heat < 50 ? "off" : cfg.heat + " C";
+}
+sh.oninput = () => { cfg.heat = Number(sh.value); showHeat(); };
+sh.onchange = () => { save(); log({ev: "setting", name: "heat", value: cfg.heat}); };
+// The picture size, the phone's like the fps: from its status, a change
+// restarts the capture.
+const sz = document.getElementById("sz");
+// With a screen of its own (the stream menu's Screen line), the size is
+// this window's shape at the long side chosen, for the phone to make.
+function fitted(long) {
+  const w = innerWidth * devicePixelRatio, h = innerHeight * devicePixelRatio;
+  const r = w / h;
+  let W = r >= 1 ? long : long * r, H = r >= 1 ? long / r : long;
+  // Multiples of 16, H.264's blocks: at 1280x666 the encoder padded 6 rows,
+  // seen as a thin line flickering at the picture's edge (2026-11-20).
+  return [Math.round(W / 16) * 16, Math.round(H / 16) * 16];
+}
+sz.onchange = () => {
+  delete pending.long; delete pending.w; delete pending.h;
+  if (phone.screen && phone.screen !== "phone") [pending.w, pending.h] = fitted(Number(sz.value));
+  else pending.long = Number(sz.value);
+  showPending();
+};
+function showRate() { sb.value = cfg.rate; sbv.textContent = cfg.rate; }
+const st = document.getElementById("st");
+function showSteady() { st.checked = cfg.steady; wp.checked = cfg.wifi_awake; ad.checked = cfg.adaptive; }
+const ad = document.getElementById("ad");
+ad.onchange = () => { cfg.adaptive = ad.checked; save(); log({ev: "setting", name: "adaptive", value: cfg.adaptive}); };
+const wp = document.getElementById("wp");
+wp.onchange = () => { cfg.wifi_awake = wp.checked; save(); log({ev: "setting", name: "wifi_awake", value: cfg.wifi_awake}); };
+st.onchange = () => { cfg.steady = st.checked; save(); log({ev: "setting", name: "steady", value: cfg.steady}); };
+function refresh() { showHeat(); showFps(); showRate(); showSteady(); showMode(); showInput(); showFold(); showSliders(); showSound(); applyDelay(); }
+refresh();
+
+const pc = new RTCPeerConnection();
+pc.ondatachannel = e => {
+  if (e.channel.label === "fast") { fast = e.channel; return; }
+  if (e.channel.label === "video") {
+    e.channel.binaryType = "arraybuffer";
+    e.channel.onopen = () => log({ev: "video-channel-open"});
+    e.channel.onmessage = onVideo;
+    newDecoder();
+    return;
+  }
+  chan = e.channel;
+  chan.onopen = () => log({ev: "channel-open"});
+  // The phone's server stopped or started again: connect once it is back.
+  chan.onclose = () => setTimeout(reloadWhenUp, 1000);
+  // The phone restarts its capture (a new fps): connect again.
+  chan.onmessage = m => {
+    try {
+      const o = JSON.parse(m.data);
+      if (o.t === "reconnect") setTimeout(reloadWhenUp, 1000);
+    } catch (e) {}
+  };
+};
+// The server may be starting again (a new bit rate, size or rate): reload
+// once it answers.
+async function reloadWhenUp() {
+  for (;;) {
+    try { if ((await fetch(withKey("/check"))).ok) return location.reload(); }
+    catch (e) {}
+    await new Promise(done => setTimeout(done, 500));
+  }
+}
+pc.onconnectionstatechange = () => {
+  if (pc.connectionState === "failed") setTimeout(reloadWhenUp, 1000);
+};
+// Picture and sound in one stream, played by the video element.
+const media = new MediaStream();
+pc.ontrack = e => {
+  if (e.track.kind === "audio") arx = e.receiver; else vrx = e.receiver;
+  media.addTrack(e.track);
+  applyDelay();
+  if (v.srcObject !== media) {
+    v.srcObject = media;
+    draw();
+  }
+  v.play().catch(err => log({ev: "play-failed", err: String(err)}));
+};
+
+// The key box, when the phone wants a key and none or a wrong one was given.
+const gate = document.getElementById("gate"), gk = document.getElementById("gk");
+function askKey(wrong) {
+  document.getElementById("gm").textContent = wrong ? "Wrong key" : "";
+  gate.style.display = "block";
+  gk.value = "";
+  gk.focus();
+}
+function enterKey() {
+  key = gk.value.trim();
+  store.set("key", key);
+  gate.style.display = "none";
+  connect();
+}
+document.getElementById("go").onclick = enterKey;
+gk.addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); enterKey(); } });
+
+let started = false;
+async function connect() {
+  const check = await fetch(withKey("/check"));
+  if (check.status === 403) { askKey(key !== ""); return; }
+  if (started) return;
+  started = true;
+  log({ev: "page", ua: navigator.userAgent, w: innerWidth, h: innerHeight,
+       dpr: devicePixelRatio, pointer: !!window.PointerEvent,
+       touch: "ontouchstart" in window, rvfc: "requestVideoFrameCallback" in
+       HTMLVideoElement.prototype, webcodecs: "VideoDecoder" in window});
+  try {
+    const kept = await (await fetch(withKey("/settings"))).json();
+    if (P.get("mode")) { delete kept.canvas; delete kept.direct; }
+    if (P.get("input")) delete kept.input;
+    delete kept.touch;
+    Object.assign(cfg, kept);
+    store.set("settings", cfg);
+    refresh();
+  } catch (e) {}
+  await status();
+  const codecs = RTCRtpReceiver.getCapabilities("video").codecs;
+  const codec = P.get("codec") || keptCodec()
+    || (codecs.some(c => /h264/i.test(c.mimeType)) ? "h264" : "vp8");
+  log({ev: "codecs", list: [...new Set(codecs.map(c => c.mimeType))], codec});
+  // DIRECT's video comes by WebSocket and WebCodecs, not WebRTC: it needs
+  // no H.264 in the browser's WebRTC (Firefox has none without OpenH264,
+  // and lost DIRECT to VP8, 2026-11-20).  Its offer asks for H.264 all the
+  // same; such a browser declines the video part, sound and input stay.
+  if (cfg.direct && !directOk()) { cfg.direct = false; showMode(); }
+  // A screen of its own still to make (Client, Multi-monitor): at this
+  // window's shape at once, not fitted by a second restart.
+  const fit = phone.waiting ? fitted(phone.long || 1280) : null;
+  const asked = await fetch(withKey("/offer?codec=" + (cfg.direct ? "h264" : codec)
+                                    + "&mbps=" + cfg.rate
+                                    + (cfg.direct ? "&direct=1" : "")
+                                    + (fit ? "&w=" + fit[0] + "&h=" + fit[1] : "")));
+  if (asked.status === 503) { setTimeout(reloadWhenUp, 1000); return; }
+  // The phone asks its owner first (the stream menu's Approval).
+  if (asked.status === 202) {
+    note("Waiting for approval on the phone\\u2026");
+    started = false;
+    setTimeout(connect, 2000);
+    return;
+  }
+  if (asked.status === 403) { note("Refused on the phone"); return; }
+  const offer = await asked.text();
+  await pc.setRemoteDescription({type: "offer", sdp: offer});
+  await pc.setLocalDescription(await pc.createAnswer());
+  await new Promise(done => {
+    if (pc.iceGatheringState === "complete") return done();
+    pc.onicegatheringstatechange = () =>
+      pc.iceGatheringState === "complete" && done();
+    setTimeout(done, 2000);
+  });
+  await fetch(withKey("/answer"), {method: "POST", body: pc.localDescription.sdp});
+  if (codec === "h264" && !cfg.direct) vp8IfNothing(pc, () => location.replace(withKey("/")));
+  if (cfg.direct) openVideo();
+}
+// DIRECT's frames by WebSocket on the same address (the phone's /video):
+// a WebRTC data channel for them drained at about 4 kB/s (2026-11-20).
+let videoOpened = false;
+function openVideo() {
+  const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://")
+                           + location.host + withKey("/video"));
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => {
+    videoOpened = true;
+    log({ev: "video-socket-open"}); newDecoder(); needKey = true; send({t: "keyframe"});
+  };
+  ws.onmessage = onVideo;
+  // The phone's server started again or the socket dropped: once more.
+  ws.onclose = () => setTimeout(() => { if (cfg.direct) openVideo(); }, 1000);
+  // Never opened in 4 s: VIDEO (WebRTC) for this tab.  Firefox behind
+  // Tailscale Funnel never saw the socket open, though the phone took it,
+  // and showed black (2026-11-20; Chromium through the same Funnel did).
+  if (!videoOpened)
+    setTimeout(() => {
+      if (videoOpened || !cfg.direct) return;
+      log({ev: "video-socket-failed"});
+      try { sessionStorage.setItem("nodirect", "1"); } catch (x) {}
+      location.reload();
+    }, 4000);
+}
+connect();
+
+// The stream's shape against this window's, by more than 5%.
+function shapeOff() {
+  if (!picW()) return false;
+  const a = picW() / picH(), b = innerWidth / innerHeight;
+  return Math.abs(a / b - 1) > 0.05;
+}
+// What the browser reports, every second (logged every 10 s), in short
+// lines; the phone's temperature every 5 s, its last 10 minutes drawn.
+const it = document.getElementById("it");
+const prev = {};
+function delta(id, field, value) {
+  const k = id + field, d = value - (prev[k] === undefined ? value : prev[k]);
+  prev[k] = value;
+  return d;
+}
+const temps = [], tc = document.getElementById("tc"), tctx = tc.getContext("2d");
+function drawTemps() {
+  tctx.clearRect(0, 0, tc.width, tc.height);
+  if (temps.length < 2) return;
+  const lo = Math.min(...temps) - 1, hi = Math.max(...temps) + 1;
+  tctx.strokeStyle = "#f80"; tctx.lineWidth = 2; tctx.beginPath();
+  temps.forEach((t, i) => {
+    const x = i * tc.width / 119, y = tc.height - (t - lo) * tc.height / (hi - lo);
+    i ? tctx.lineTo(x, y) : tctx.moveTo(x, y);
+  });
+  tctx.stroke();
+}
+let phone = {}, ticks = 0;
+// A screen of its own not of this window's shape: fitted at once, at the
+// same long side, once per shape (a refusal does not loop).
+function autofit() {
+  if (!phone.screen || phone.screen === "phone" || !phone.size || Object.keys(pending).length) return;
+  // Not while captured or fullscreen: the new size starts the phone's
+  // encoder again, the page reloads, and the capture ended at once
+  // (author, 2026-11-20).  It fits once the capture is left.
+  if (captured || document.fullscreenElement) return;
+  const [w, h] = phone.size.split("x").map(Number);
+  if (Math.abs((w / h) / (innerWidth / innerHeight) - 1) <= 0.05) return;
+  const [W, H] = fitted(Math.max(w, h));
+  const tried = "wl-cast-fit-" + W + "x" + H;
+  try { if (sessionStorage.getItem(tried)) return; sessionStorage.setItem(tried, "1"); } catch (e) {}
+  log({ev: "autofit", from: phone.size, to: W + "x" + H});
+  note("Fitting the phone's screen to this window\\u2026");
+  fetch(withKey("/apply?w=" + W + "&h=" + H), {method: "POST"})
+    .then(() => setTimeout(reloadWhenUp, 1000)).catch(() => {});
+}
+addEventListener("resize", () => setTimeout(autofit, 1500));
+async function status() {
+  try {
+    phone = await (await fetch(withKey("/status"))).json();
+    if (!screenWanted) showScreen();
+    document.getElementById("lockmsg").style.display = phone.locked ? "block" : "none";
+    autofit();
+    // The phone's settings, unless one waits for APPLY here.
+    if (phone.long && !pending.long && !pending.w && document.activeElement !== sz) sz.value = String(phone.long);
+    // The fps chosen, not the one the heat limit holds it to.
+    if (phone.target && !pending.fps && phone.target !== cfg.fps && document.activeElement !== sf) {
+      cfg.fps = phone.target; showFps();
+    }
+    if (phone.mbps && !pending.mbps && phone.mbps !== cfg.rate) {
+      cfg.rate = phone.mbps; store.set("settings", cfg); showRate();
+    }
+    if (phone.cpu !== undefined) { temps.push(phone.cpu); if (temps.length > 120) temps.shift(); }
+    if (info.style.display === "block") drawTemps();
+  } catch (e) {}
+}
+setInterval(status, 5000);
+setInterval(async () => {
+  const s = {w: innerWidth, h: innerHeight, video: picW() + "x" + picH(),
+             mode: cfg.direct ? "direct" : cfg.canvas ? "canvas" : "video", hidden: document.hidden};
+  if (cfg.direct) {
+    s.fps = delta("direct", "f", dframes);
+    s.skipped = dskipped;
+    s.keys = dkeys;
+    s.decode_queue = decoder ? decoder.decodeQueueSize : null;
+    if (ageN) { s.age_ms = Math.round(ageSum / ageN); ageSum = ageN = 0; }
+    if (encN) { s.enc_ms = Math.round(encSum / encN); encSum = encN = 0; }
+  }
+  let bytes = 0, rate = 0;
+  let pair = null; const cands = {};
+  (await pc.getStats()).forEach(r => {
+    if (r.type === "inbound-rtp") {
+      bytes += r.bytesReceived || 0;
+      rate += delta(r.id, "b", r.bytesReceived || 0) * 8 / 1000;
+      // The buffer over the last second, not since the start.
+      const n = delta(r.id, "n", r.jitterBufferEmittedCount || 0);
+      const ms = delta(r.id, "d", r.jitterBufferDelay || 0);
+      if (n > 0) s[r.kind === "audio" ? "audio_buffer_ms" : "buffer_ms"] = Math.round(1000 * ms / n);
+    }
+    if (r.type === "inbound-rtp" && r.kind === "audio") {
+      // Sound lost on the way, and the share the browser had to make up.
+      s.audio_lost = r.packetsLost;
+      const made = delta(r.id, "c", r.concealedSamples || 0);
+      const all = delta(r.id, "t", r.totalSamplesReceived || 0);
+      if (all > 0) s.audio_concealed = Math.round(100 * made / all);
+    }
+    if (r.type === "inbound-rtp" && r.kind === "video" && !cfg.direct) {
+      s.fps = delta(r.id, "f", r.framesDecoded || 0);
+      s.decoded = r.framesDecoded; s.dropped = r.framesDropped;
+      // Where frames go missing: packets lost, resend and keyframe requests,
+      // frames received but not shown.
+      s.received = r.framesReceived; s.lost = r.packetsLost;
+      s.nack = r.nackCount; s.pli = r.pliCount; s.freezes = r.freezeCount;
+    }
+    if (r.type === "codec" && /video/.test(r.mimeType)) s.codec = r.mimeType;
+    if (r.type === "candidate-pair" && r.nominated && r.currentRoundTripTime)
+      s.rtt_ms = Math.round(1000 * r.currentRoundTripTime);
+    if (r.type === "candidate-pair" && r.nominated && r.state === "succeeded") pair = r;
+    if (r.type === "local-candidate" || r.type === "remote-candidate") cands[r.id] = r;
+  });
+  // The path WebRTC took (direct on the local network, or relayed): for the
+  // TESTS through Funnel, where only the page goes through Tailscale.
+  if (pair) {
+    const side = c => c ? `${c.candidateType}/${c.protocol}/${c.address || c.ip || "?"}` : "?";
+    s.ice = side(cands[pair.localCandidateId]) + " <-> " + side(cands[pair.remoteCandidateId]);
+  }
+  s.kbps = Math.round(rate);
+  s.mb = (bytes / 1e6).toFixed(1);
+  s.settings = {smooth: cfg.smooth, av: cfg.av, mbps: cfg.rate, fps: cfg.fps, muted: v.muted};
+  s.events = counts;
+  s.temp = phone.cpu;
+  if (info.style.display === "block") {
+    const ev = Object.entries(counts).map(([a, b]) => a + " " + b);
+    const rows = [];
+    for (let i = 0; i < ev.length; i += 3) rows.push("  " + ev.slice(i, i + 3).join("  "));
+    const q = x => x === undefined ? "?" : x;
+    it.textContent = [
+      `picture ${s.video} ${(s.codec || "").replace("video/", "")}, ${s.mode}, ${cfg.input}, ${v.muted ? "muted" : "sound"}${captured ? ", captured" : ""}`,
+      `screen  ${phone.screen || "?"}${phone.screen && phone.screen !== "phone" && shapeOff() ? ", not this window's shape: SET size, APPLY" : ""}`,
+      `fps     ${q(s.fps)} shown, phone ${phone.live && phone.live < phone.fps ? phone.live + " (losses)" : phone.fps || "?"}${phone.fps < phone.target ? " (heat; chosen " + phone.target + ")" : ""}${cfg.steady ? " constant" : ""}`,
+      `rate    ${s.kbps} kbit/s of ${phone.mbps || cfg.rate} Mbit/s, ${s.mb} MB`,
+      `loss    ${q(s.lost)} packets, ${q(s.nack)} resent, ${q(s.pli)} keyframes, ${q(s.freezes)} freezes, ${q(s.dropped)} dropped`,
+      `sound   ${q(s.audio_lost)} lost, ${q(s.audio_concealed)}% made up`,
+      cfg.direct
+        ? `latency ${q(s.rtt_ms)} ms network, encoder ${q(s.enc_ms)} ms, frame ${q(s.age_ms)} ms old when drawn`
+        : `latency ${q(s.rtt_ms)} ms network, buffer ${q(s.buffer_ms)} ms video, ${q(s.audio_buffer_ms)} ms sound`,
+      `phone   ${phone.cpu === undefined ? "?" : phone.cpu + " C"}, Wi-Fi power saving ${phone.wifi_powersave || "?"}; 10 min:`,
+    ].concat(rows.length ? ["events"].concat(rows) : []).join("\\n");
+  }
+  if (++ticks % 10 === 0) log(Object.assign({ev: "stats"}, s));
+}, 1000);
+
+// Touch: touches, as on the Pro1x's own screen.  Mouse: an absolute pointer
+// (a tap clicks, a drag drags, a long press right-clicks, two fingers
+// scroll).  Pad: a touchpad moving the Pro1x's pointer from where it is (a
+// tap clicks, two fingers tap to right-click and drag to scroll, a press
+// held then moved drags).  Positions in the picture, 0 to 1.
+function norm(e) {
+  const r = shown().getBoundingClientRect();
+  const vw = picW() || r.width, vh = picH() || r.height;
+  const s = Math.min(r.width / vw, r.height / vh), dw = vw * s, dh = vh * s;
+  const x = (e.clientX - r.left - (r.width - dw) / 2) / dw;
+  const y = (e.clientY - r.top - (r.height - dh) / 2) / dh;
+  return {x: Math.min(1, Math.max(0, x)), y: Math.min(1, Math.max(0, y))};
+}
+const active = new Map();
+let down = false, start = null, scrollAt = null, timer = null, moved = false;
+let padLast = null, padStart = 0, padMax = 0, padHeld = false;
+function centre() {
+  let x = 0, y = 0;
+  for (const p of active.values()) { x += p.clientX; y += p.clientY; }
+  return {x: x / active.size, y: y / active.size};
+}
+function scroll() {
+  const p = centre(), dy = p.y - scrollAt.y, dx = p.x - scrollAt.x, step = 20;
+  if (Math.abs(dy) >= step || Math.abs(dx) >= step) {
+    send({t: "scroll", v: Math.round(dy / step), h: Math.round(-dx / step)});
+    scrollAt = p;
+  }
+}
+// A real mouse in the MOUSE mode: its buttons as they are, the pointer
+// following it with or without a button down (author, 2026-11-19: right
+// and middle clicks and hovering did not come through).  In the TOUCH and
+// PAD modes a mouse acts as they say (author); the wheel works in all.
+const MOUSE = ["left", "middle", "right"];
+let lastMove = 0;
+function mouseMove(e) {
+  const now = performance.now();
+  if (now - lastMove < 12) return;          // about a frame
+  lastMove = now;
+  const n = norm(e);
+  send({t: "move", x: n.x, y: n.y});
+}
+function press(e) {
+  if (captured) return;
+  if (e.target.closest && e.target.closest("#bar, #set, #gate")) return;
+  e.preventDefault();
+  if (e.pointerType === "mouse" && cfg.input === "mouse") {
+    const n = norm(e);
+    send({t: "move", x: n.x, y: n.y});
+    if (e.button === 0) send({t: "down", x: n.x, y: n.y});
+    else send({t: "rbtn", b: MOUSE[e.button] || "left", d: 1});
+    return;
+  }
+  active.set(e.pointerId, e);
+  if (logged++ < 20) log({ev: "pointerdown", type: e.pointerType, n: active.size});
+  if (cfg.input === "touch") {
+    const n = norm(e);
+    send({t: "tdown", id: e.pointerId, x: n.x, y: n.y});
+    return;
+  }
+  if (cfg.input === "pad") {
+    if (active.size === 1) {
+      padLast = {x: e.clientX, y: e.clientY}; padStart = Date.now(); padMax = 1;
+      moved = false; padHeld = false;
+      timer = setTimeout(() => {
+        if (!moved) { padHeld = true; send({t: "rbtn", b: "left", d: 1}); }
+      }, 400);
+    } else {
+      clearTimeout(timer); padMax = Math.max(padMax, active.size);
+      scrollAt = centre();
+    }
+    return;
+  }
+  if (active.size === 1) {
+    const n = norm(e);
+    send({t: "move", x: n.x, y: n.y});
+    send({t: "down", x: n.x, y: n.y});
+    down = true; moved = false; start = {x: e.clientX, y: e.clientY};
+    timer = setTimeout(() => {
+      if (down && !moved) { send({t: "up"}); down = false; send({t: "right"}); }
+    }, 700);
+  } else if (active.size === 2) {
+    clearTimeout(timer);
+    if (down) { send({t: "up"}); down = false; }
+    scrollAt = centre();
+  }
+}
+function move(e) {
+  if (captured) return;
+  if (e.pointerType === "mouse" && cfg.input === "mouse") {
+    if (!(e.target.closest && e.target.closest("#bar, #set, #gate, #info"))) mouseMove(e);
+    return;
+  }
+  if (!active.has(e.pointerId)) return;
+  e.preventDefault();
+  active.set(e.pointerId, e);
+  if (cfg.input === "touch") {
+    const n = norm(e);
+    send({t: "tmove", id: e.pointerId, x: n.x, y: n.y});
+    return;
+  }
+  if (cfg.input === "pad") {
+    if (active.size === 1 && padLast) {
+      const dx = e.clientX - padLast.x, dy = e.clientY - padLast.y;
+      if (Math.abs(dx) + Math.abs(dy) > 0) {
+        if (Math.abs(dx) + Math.abs(dy) > 3) moved = true;
+        send({t: "rel", dx: dx * 1.5, dy: dy * 1.5});
+        padLast = {x: e.clientX, y: e.clientY};
+      }
+    } else if (active.size >= 2 && scrollAt) {
+      moved = true;
+      scroll();
+    }
+    return;
+  }
+  if (active.size === 1 && down) {
+    if (Math.hypot(e.clientX - start.x, e.clientY - start.y) > 10) moved = true;
+    const n = norm(e);
+    send({t: "move", x: n.x, y: n.y});
+  } else if (active.size === 2 && scrollAt) {
+    scroll();
+  }
+}
+function release(e) {
+  if (e.pointerType === "mouse" && cfg.input === "mouse" && !captured && e.type === "pointerup") {
+    if (e.target.closest && e.target.closest("#bar, #set, #gate")) return;
+    if (e.button === 0) send({t: "up"});
+    else send({t: "rbtn", b: MOUSE[e.button] || "left", d: 0});
+    return;
+  }
+  if (!active.has(e.pointerId)) return;
+  active.delete(e.pointerId);
+  if (cfg.input === "touch") { send({t: "tup", id: e.pointerId}); return; }
+  if (cfg.input === "pad") {
+    clearTimeout(timer);
+    if (active.size === 0) {
+      if (padHeld) send({t: "rbtn", b: "left", d: 0});
+      else if (!moved && Date.now() - padStart < 300) {
+        const b = padMax >= 2 ? "right" : "left";
+        send({t: "rbtn", b, d: 1}); send({t: "rbtn", b, d: 0});
+      }
+      padLast = null; scrollAt = null; padHeld = false;
+    } else {
+      // The finger left takes over the moving.
+      const p = active.values().next().value;
+      padLast = {x: p.clientX, y: p.clientY};
+      if (active.size < 2) scrollAt = null;
+    }
+    return;
+  }
+  clearTimeout(timer);
+  if (down && active.size === 0) { send({t: "up"}); down = false; }
+  if (active.size < 2) scrollAt = null;
+}
+addEventListener("pointerdown", press, {passive: false});
+addEventListener("pointermove", move, {passive: false});
+addEventListener("pointerup", release);
+addEventListener("pointercancel", release);
+
+// Capture: fullscreen, the keyboard locked (Chromium's Keyboard Lock: Super,
+// Alt+Tab and the like come here instead of the computer's desktop, where
+// its compositor allows it) and the mouse pointer locked (relative moves).
+// Every key goes to the Pro1x, down and up, until capture ends: Esc held
+// (the browser's way out), Ctrl+Alt+Shift+Q (Moonlight's kind of combo), a
+// touch on CAPTURED, or a press held 3 s without moving; then any key still
+// down is released.  The locked mouse cannot reach the buttons, and a car
+// may have neither Esc nor a keyboard: touches reach them (the pointer lock
+// is the mouse's only), and the held press works where a browser makes
+// mouse events of touches (author, 2026-11-19).
+let captured = false;
+function note(text) {
+  const n = document.getElementById("note");
+  n.textContent = text; n.style.display = "block";
+  setTimeout(() => n.style.display = "none", 6000);
+}
+const bp = document.getElementById("bp");
+function showCapture() { bp.textContent = captured ? "CAPTURED" : "FREE"; }
+async function capture() {
+  try { await document.documentElement.requestFullscreen(); } catch (e) {}
+  if (navigator.keyboard && navigator.keyboard.lock) {
+    try { await navigator.keyboard.lock(); }
+    catch (e) { log({ev: "keyboard-lock-failed", err: String(e)}); }
+  } else {
+    // Firefox has no Keyboard Lock: the desktop keeps its shortcuts (Super).
+    note("This browser cannot capture Super and other desktop shortcuts: " +
+         "use a Chromium-based one, or a pass-through mode of your desktop");
+    log({ev: "keyboard-lock-missing"});
+  }
+  try { await shown().requestPointerLock(); }
+  catch (e) { log({ev: "pointer-lock-failed", err: String(e)}); }
+  if (navigator.keyboard && navigator.keyboard.lock)
+    note("Out of capture: touch CAPTURED, hold a press 3 s, Esc held, or Ctrl+Alt+Shift+Q");
+  else note("No Super nor desktop shortcuts here (Chromium has them).  " +
+            "Out of capture: touch CAPTURED, hold a press 3 s, or Esc");
+}
+function release_capture() {
+  try { if (navigator.keyboard && navigator.keyboard.unlock) navigator.keyboard.unlock(); } catch (e) {}
+  if (document.pointerLockElement) document.exitPointerLock();
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+}
+bp.onclick = () => { if (captured) release_capture(); else capture(); };
+function captureChanged() {
+  const now = !!document.pointerLockElement;
+  if (now === captured) return;
+  captured = now;
+  if (!captured) { send({t: "allup"}); release_capture(); }
+  showCapture();
+  log({ev: "capture", on: captured});
+}
+document.addEventListener("pointerlockchange", captureChanged);
+document.addEventListener("fullscreenchange", () => {
+  if (!document.fullscreenElement && captured) release_capture();
+});
+const BUTTONS = ["left", "middle", "right"];
+// A press held still for 3 s: out of capture.
+let holdTimer = null, holdMoved = 0;
+function holdEnd() { clearTimeout(holdTimer); holdTimer = null; }
+document.addEventListener("mousemove", e => {
+  if (captured && (e.movementX || e.movementY)) send({t: "rel", dx: e.movementX, dy: e.movementY});
+  if (holdTimer && (holdMoved += Math.abs(e.movementX) + Math.abs(e.movementY)) > 30) holdEnd();
+});
+// The buttons' own: a touch on them makes mouse events too.
+const onButtons = e => e.target.closest && e.target.closest("#bar, #set, #gate");
+document.addEventListener("mousedown", e => {
+  if (!captured || onButtons(e)) return;
+  e.preventDefault();
+  send({t: "rbtn", b: BUTTONS[e.button] || "left", d: 1});
+  holdEnd(); holdMoved = 0;
+  holdTimer = setTimeout(() => { holdTimer = null; release_capture(); }, 3000);
+});
+document.addEventListener("mouseup", e => {
+  holdEnd();
+  if (!captured || onButtons(e)) return;
+  e.preventDefault();
+  send({t: "rbtn", b: BUTTONS[e.button] || "left", d: 0});
+});
+// The wheel in every mode: notches added up from smooth deltas (pixels,
+// lines or pages), at the pointer when not captured.
+let wheelV = 0, wheelH = 0;
+document.addEventListener("wheel", e => {
+  if (onButtons(e) || (e.target.closest && e.target.closest("#info"))) return;
+  e.preventDefault();
+  const unit = e.deltaMode === 1 ? 1 / 3 : e.deltaMode === 2 ? 3 : 1 / 100;
+  wheelV -= e.deltaY * unit; wheelH += e.deltaX * unit;
+  const v = Math.trunc(wheelV), h = Math.trunc(wheelH);
+  if (!v && !h) return;
+  wheelV -= v; wheelH -= h;
+  const m = {t: "scroll", v, h};
+  if (!captured) Object.assign(m, norm(e));
+  send(m);
+}, {passive: false});
+document.addEventListener("keydown", e => {
+  if (!captured || !e.code) return;
+  e.preventDefault();
+  if (e.code === "KeyQ" && e.ctrlKey && e.altKey && e.shiftKey) {
+    release_capture();
+    return;
+  }
+  if (!e.repeat) send({t: "kd", code: e.code});
+}, {capture: true});
+document.addEventListener("keyup", e => {
+  if (!captured || !e.code) return;
+  e.preventDefault();
+  send({t: "ku", code: e.code});
+}, {capture: true});
+// The browser's own menu never on the picture: right clicks go to the Pro1x.
+document.addEventListener("contextmenu", e => { if (captured || !onButtons(e)) e.preventDefault(); });
+showCapture();
+
+// Keys: the key's position when the browser gives it, else the text typed.
+k.addEventListener("keydown", e => {
+  if (e.code && e.code !== "Unidentified" && e.key !== "Process") {
+    e.preventDefault();
+    send({t: "key", code: e.code, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey});
+  }
+});
+// Keys typed on the page itself go to the Pro1x too, not only in the LKB
+// box (author, 2026-11-19: a terminal on the phone got none): not in the
+// page's own fields, not modifiers alone (they go with the key), and not
+// F5, F11 or F12 (the browser's reload, fullscreen and tools).
+addEventListener("keydown", e => {
+  if (captured || e.target === k) return;
+  if (e.target.closest && e.target.closest("input, select, textarea")) return;
+  if (!e.code || e.code === "Unidentified" || e.key === "Process") return;
+  if (/^(Shift|Control|Alt|Meta|OS)(Left|Right)$/.test(e.code) || ["F5", "F11", "F12"].includes(e.code)) return;
+  e.preventDefault();
+  send({t: "key", code: e.code, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey});
+});
+k.addEventListener("input", e => {
+  if (k.value) {
+    send({t: "text", text: k.value});
+  }
+  k.value = "";
+});
+</script>
+"""
+
+
+def raw_source(fd, size):
+    """The pipe of raw frames, read a frame at a time.  fdsrc's 4 KiB reads
+    held the encoder to 9 frames a second at 1920x960, against 28 so
+    (2026-11-18), and the frames waiting in the pipe became seconds of
+    delay."""
+    width, height = map(int, size.split("@")[0].split("x"))
+    return f"fdsrc fd={fd} blocksize={width * height * 3 // 2}"
+
+
+def hardware(size, parse=True, mbps=6.0, gop=10):
+    """Elements from raw NV12 frames to H.264, by the phone's encoder, from
+    the bytes of a pipe (PARSE) or from frames, a keyframe every GOP
+    seconds.  If the encoder falls behind, the oldest frame waiting is
+    dropped, so the delay cannot grow.
+
+    The peak rate is the rate asked (Venus's default peak, 2 Mbit/s, held
+    it below), and the picture is refreshed a part at a time over a second
+    (cyclic intra refresh, as game streaming does), so that no frame is a
+    large keyframe burst on the link.  Venus's constant bit rate sent twice
+    the rate asked (6-8 Mbit/s for 3, 2026-11-19), so the variable one was
+    used; that one sent 4 to 7 times it (8-15 Mbit/s for 2, 2026-11-20):
+    the constant one again.
+    Venus here ignores slice limits (one slice a frame, by bytes or by
+    macroblocks, 2026-11-19).  Set only at the start: changing controls on
+    a running encoder killed its firmware."""
+    dimensions, fps = size.split("@")
+    width, height = map(int, dimensions.split("x"))
+    return (
+        (f"rawvideoparse width={width} height={height} format=nv12 "
+         f'framerate={fps}/1 plane-strides="<{width},{width}>" '
+         f'plane-offsets="<0,{width * height}>" ! ' if parse else "")
+        + "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 "
+        "leaky=downstream ! "
+        'v4l2h264enc name=enc extra-controls="controls,'
+        f'video_bitrate_mode=1,video_bitrate={int(mbps * 1e6)},'
+        f'video_peak_bitrate={int(mbps * 1e6)},'
+        f'intra_refresh_period={int(fps)},intra_refresh_period_type=1,'
+        f'video_gop_size={gop * int(fps)},h264_i_frame_period={gop * int(fps)};" ! '
+        "video/x-h264,profile=constrained-baseline,level=(string)4 ! "
+        "h264parse config-interval=-1"
+    )
+
+
+class Portal:
+    """The screen through xdg-desktop-portal's ScreenCast (PipeWire), in
+    place of wf-recorder for the whole screen: the portal's back end hands
+    over Sway's frames as DMA-BUFs, the GPU turns, scales and converts them
+    to NV12, and only the encoder's copy touches them on the CPU.  At 1920
+    wide on a busy screen, 18 fps for about 95% of a core with Sway's share,
+    against 195% for wf-recorder's path (2026-11-18).  One session, for the
+    server's life, feeds the encoder of Producer.  Needs
+    xdg-desktop-portal-wlr's config to pick the output without asking
+    (chooser_type=none, output_name)."""
+
+    PORTAL = ("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
+              "org.freedesktop.portal.ScreenCast")
+    # Sway's transform of the output, to the turn that shows it upright.
+    FLIP = {"90": "counterclockwise", "270": "clockwise", "180": "rotate-180"}
+
+    def __init__(self, turn):
+        from gi.repository import Gio
+        self.flip = self.FLIP.get(turn, "none")
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+        self.sender = self.bus.get_unique_name()[1:].replace(".", "_")
+        self.count = 0
+        self.session = None
+        # Once at start, to fall back to wf-recorder if the portal fails;
+        # a moment before the next session (a session opened at once after
+        # it could stay without buffers, 2026-11-19).
+        self.open()
+        self.close()
+        time.sleep(0.5)
+
+    def open(self):
+        """A new portal session; its stream's node serial in self.serial."""
+        self.count += 1
+        t = f"p{self.count}"
+        r = self.request("CreateSession", GLib.Variant("(a{sv})", ({
+            "handle_token": GLib.Variant("s", t + "a"),
+            "session_handle_token": GLib.Variant("s", t)},)), t + "a")
+        self.session = r["session_handle"]
+        self.request("SelectSources", GLib.Variant("(oa{sv})", (self.session, {
+            "handle_token": GLib.Variant("s", t + "b"),
+            "types": GLib.Variant("u", 1),        # a monitor
+            "cursor_mode": GLib.Variant("u", 2)})), t + "b")   # drawn in
+        r = self.request("Start", GLib.Variant("(osa{sv})", (self.session, "", {
+            "handle_token": GLib.Variant("s", t + "c")})), t + "c")
+        node = r["streams"][0][0]
+        # pipewiresrc finds a node by its serial, which the portal does not
+        # give; the stream's node appears in pw-dump a moment later.
+        self.serial = None
+        for _ in range(20):
+            out = subprocess.run(["pw-dump"], capture_output=True, text=True).stdout
+            for o in json.loads(out or "[]"):
+                if o.get("id") == node:
+                    self.serial = (o.get("info", {}).get("props") or {}).get("object.serial")
+            if self.serial:
+                break
+            time.sleep(0.25)
+        if not self.serial:
+            raise RuntimeError(f"no serial for node {node}")
+
+    def close(self):
+        """The portal session ends, and with it the back end's capture."""
+        if self.session:
+            try:
+                self.bus.call_sync(self.PORTAL[0], self.session,
+                                   "org.freedesktop.portal.Session", "Close",
+                                   None, None, 0, -1, None)
+            except GLib.Error:
+                pass
+            self.session = None
+
+    def request(self, method, args, token):
+        """Call METHOD and wait for its Request's Response; its results."""
+        path = f"/org/freedesktop/portal/desktop/request/{self.sender}/{token}"
+        got = {}
+        loop = GLib.MainLoop()
+
+        def on_response(_c, _s, _p, _i, _sig, params):
+            got["code"], got["results"] = params.unpack()
+            loop.quit()
+
+        sub = self.bus.signal_subscribe(self.PORTAL[0], "org.freedesktop.portal.Request",
+                                        "Response", path, None, 0, on_response)
+        self.bus.call_sync(*self.PORTAL, method, args, None, 0, -1, None)
+        GLib.timeout_add_seconds(10, loop.quit)
+        loop.run()
+        self.bus.signal_unsubscribe(sub)
+        if got.get("code") != 0:
+            raise RuntimeError(f"{method}: {got.get('code', 'no answer')}")
+        return got["results"]
+
+    def video(self, pipeline, size, sink):
+        """The elements from the portal's frames to raw NV12 at SIZE, added
+        to PIPELINE and linked to SINK.  Linked without the caps check:
+        glupload tells which DMA-BUF formats it imports only once its GL
+        context exists, and parse_launch's links fail before that.  The
+        queue after the import lets PipeWire have its buffer back at once
+        (18 fps against 15 without it); use-bufferpool must stay on, or
+        pipewiresrc copies every frame out of its DMA-BUF (98% of a core)."""
+        dimensions, fps = size.split("@")
+        width, height = dimensions.split("x")
+        # Scaled before it is turned, so that the turn has fewer pixels:
+        # 26 fps out of the GPU against 19 the other way round, with a
+        # screen changing all the time (2026-11-19).
+        turned = self.flip in ("clockwise", "counterclockwise")
+        parts = [
+            "pipewiresrc name=pw min-buffers=8 do-timestamp=true stream-properties="
+            "props,media.type=Video,media.category=Capture,media.role=Screen,"
+            f"target.object={self.serial}",
+            # The portal's frames were already 400 ms old here, whatever
+            # the frame rate (5 to 28 a second), the buffers (2 to 8) or the
+            # rate asked of the portal; pipewiresrc hands its buffers over
+            # oldest first, one at a time (read from the portal's frames
+            # with WL_CAST_BENCH, 2026-11-20).  This queue takes them
+            # at once, the newest winning: WL_CAST_PW_LEAKY=1, untried
+            # (the phone hung 30 s after its first start, as it did after
+            # another restart without it: restarting the server hangs the
+            # phone at times).
+            *(["queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream"]
+              if os.environ.get("WL_CAST_PW_LEAKY") == "1" else []),
+            # Below the portal's own 30 fps only: videorate also dropped
+            # frames it need not (15.4 fps out of the GPU without it, 11 with,
+            # 2026-11-19).
+            *([f"videorate drop-only=true max-rate={fps}"] if int(fps) < 30 else []),
+            "video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=XR24",
+            "glupload",
+            "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream",
+            # On a screen of its own (Client, Multi-monitor) the frames have
+            # the stream's size and are upright already: neither the scale
+            # nor the turn, two GPU passes for nothing (the GPU passed 10 of
+            # the portal's 16 fps at 1600x800, 2026-11-20).
+            *([] if screen else [
+                "glcolorscale",
+                "video/x-raw(memory:GLMemory),"
+                + (f"width={height},height={width}" if turned
+                   else f"width={width},height={height}"),
+                f"glvideoflip method={self.flip}"]),
+            "glcolorconvert", "video/x-raw(memory:GLMemory),format=NV12",
+            "gldownload", "video/x-raw,format=NV12",
+            # The portal's frames come at a variable rate, and the encoder
+            # planned for less: 20.6 fps with the rate set, 18.8 without.
+            f"capssetter caps=video/x-raw,framerate={fps}/1",
+        ]
+        prev = None
+        for part in parts:
+            if part.startswith("video/"):
+                e = Gst.ElementFactory.make("capsfilter")
+                e.set_property("caps", Gst.Caps.from_string(part))
+            else:
+                e = Gst.parse_launch(part)
+            pipeline.add(e)
+            if prev is not None:
+                prev.get_static_pad("src").link_full(e.get_static_pad("sink"),
+                                                     Gst.PadLinkCheck.NOTHING)
+            prev = e
+        prev.get_static_pad("src").link_full(sink.get_static_pad("sink"),
+                                             Gst.PadLinkCheck.NOTHING)
+
+
+portal = None
+
+
+def output_shape(name):
+    """The output's scale and mode, as Sway reports them."""
+    for o in sway("-t", "get_outputs") or []:
+        if o.get("name") == name:
+            m = o.get("current_mode") or {}
+            return (o.get("scale"), m.get("width"), m.get("height"), o.get("transform"))
+    return None
+
+
+def watch_output(name):
+    """The captured output's scale, size or rotation changed (Super+- or
+    Super+=): the capture stopped sending frames, so the stream starts
+    again (author, 2026-11-20: frozen until refreshed)."""
+    shape = output_shape(name)
+    try:
+        events = subprocess.Popen(["swaymsg", "-m", "-t", "subscribe", '["output"]'],
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    except OSError:
+        return
+    for _ in events.stdout:
+        now = output_shape(name)
+        if now and shape and now != shape:
+            log_line(f"{name} changed {shape} -> {now}: starting again")
+            GLib.idle_add(lambda: restart_session() and False)
+            break
+    events.terminate()
+
+
+def sway(*args):
+    """swaymsg's JSON answer, or None."""
+    try:
+        return json.loads(subprocess.run(["swaymsg", "-r", *args], capture_output=True,
+                                         text=True, timeout=5).stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+class Screen:
+    """A Sway output of the stream's own (--screen client|multi-monitor,
+    the stream menu's Screen line): a headless output at the size the
+    viewer's window asks for (its shape, squarish in a car), with the
+    workspace "stream", captured by the portal in place of the panel
+    (wl-cast-output) and played on by the viewer's input.  Client:
+    the panel shows it too (wl-mirror); multi-monitor: the panel keeps its
+    own workspaces, as a second monitor.  Kept over a
+    restart of the server (a new size), removed at its end; its windows
+    go back to the panel then."""
+
+    FILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "wl-cast-output")
+    SIZE = os.path.join(os.environ.get("XDG_STATE_HOME")
+                        or os.path.expanduser("~/.local/state"), "wl-cast-screen-size")
+
+    def __init__(self, mode, size):
+        self.mode, self.mirror = mode, None
+        width, height = size.split("@")[0].split("x")
+
+        outputs = sway("-t", "get_outputs") or []
+        names = {o["name"] for o in outputs}
+        self.name = os.environ.pop("WL_CAST_OUTPUT", "")
+        if self.name not in names:
+            subprocess.run(["swaymsg", "create_output"], capture_output=True, timeout=5)
+            new = {o["name"] for o in sway("-t", "get_outputs") or []} - names
+            if not new:
+                raise RuntimeError("Sway made no output")
+            self.name = new.pop()
+        # Right of the others, so that the panel's pointer and windows do
+        # not wander into it.
+        right = max((o["rect"]["x"] + o["rect"]["width"] for o in outputs
+                     if o["name"] != self.name), default=0)
+        # Upright and unscaled whatever the panel's settings, and a custom
+        # mode at 60 Hz: with "resolution" Sway gave it a refresh of 0, it
+        # never redrew, and the capture's first frame never came, which
+        # held the portal's capture for good (2026-11-19).
+        for command in (f"output {self.name} transform normal scale 1",
+                        f"output {self.name} mode --custom {width}x{height}@60Hz "
+                        f"position {right} 0"):
+            subprocess.run(["swaymsg", "--", command], capture_output=True, timeout=5)
+        # Multi-monitor: the workspace "stream" for it (the rule places it
+        # only when it is made; one left on the panel is moved over).
+        # Client: the phone's own workspaces go to it (client); an empty
+        # "stream" there vanished once left (author, 2026-11-19).
+        if mode != "client":
+            for command in (f"workspace stream output {self.name}",
+                            f"focus output {self.name}", "workspace stream",
+                            f"move workspace to output {self.name}"):
+                subprocess.run(["swaymsg", command], capture_output=True, timeout=5)
+        with open(self.FILE, "w") as f:
+            f.write(self.name + "\n")
+        self.guard = None
+        if mode == "client":
+            self.client()
+        log_line(f"screen of its own: {self.name} {width}x{height}" + (", mirrored" if self.mirror else ""))
+
+    def client(self):
+        """The whole phone at the client's shape (author, 2026-11-19): every
+        workspace moves onto the stream's output, and the panel only shows
+        it (wl-mirror, on a workspace of its own, never focused).  The
+        focus is taken back whenever it lands on the panel: there the menus
+        and apps opened out of the stream, under the mirror."""
+        swaymsg = lambda command: subprocess.run(["swaymsg", "--", command],
+                                                 capture_output=True, timeout=5)
+        swaymsg('no_focus [app_id="^at.yrlf.wl_mirror$"]')
+        for ws in sway("-t", "get_workspaces") or []:
+            if ws["output"] != self.name:
+                swaymsg(f'workspace "{ws["name"]}"')
+                swaymsg(f"move workspace to output {self.name}")
+        swaymsg(f"focus output {PANEL}")
+        swaymsg("workspace mirror")
+        try:
+            self.mirror = subprocess.Popen(
+                ["wl-mirror", "--fullscreen-output", PANEL, self.name],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+        except OSError as e:
+            log_line(f"no mirror on the panel: {e}")
+        time.sleep(1)
+        swaymsg(f"focus output {self.name}")
+        # One of the phone's workspaces in front: an empty "stream" left from
+        # an earlier mode then goes (Sway drops it once it is not shown).
+        mine = [w["name"] for w in sway("-t", "get_workspaces") or []
+                if w["output"] == self.name and w["name"] != "stream"]
+        if mine:
+            swaymsg(f'workspace "{mine[0]}"')
+
+        def guard():
+            focused = next((w["output"] for w in sway("-t", "get_workspaces") or []
+                            if w.get("focused")), None)
+            if focused and focused != self.name:
+                subprocess.run(["swaymsg", f"focus output {self.name}"],
+                               capture_output=True, timeout=5)
+            return GLib.SOURCE_CONTINUE
+        self.guard = GLib.timeout_add_seconds(2, guard)
+
+    @classmethod
+    def kept(cls, size):
+        """SIZE with the last width and height a viewer chose, if any."""
+        try:
+            with open(cls.SIZE) as f:
+                dims = f.read().strip()
+            width, height = map(int, dims.split("x"))
+            width, height = width // 16 * 16, height // 16 * 16   # H.264's blocks
+            return f"{width}x{height}@{size.split('@')[1]}"
+        except (OSError, ValueError):
+            return size
+
+    def stop(self, keep=False):
+        if self.guard:
+            GLib.source_remove(self.guard)
+            self.guard = None
+        if self.mirror:
+            self.mirror.terminate()
+            self.mirror = None
+        if keep:
+            return
+        try:
+            os.remove(self.FILE)
+        except OSError:
+            pass
+        # The workspace shown on the stream's screen as it ends, shown on
+        # the panel after: the stream may be where it was changed (author).
+        shown = [w["name"] for w in sway("-t", "get_workspaces") or []
+                 if w.get("output") == self.name and w.get("visible")]
+        subprocess.run(["swaymsg", f"output {self.name} unplug"], capture_output=True, timeout=5)
+        # The on-screen keyboard back to the panel, if moved here.
+        subprocess.run(["swaymsg", "exec pro1x-osk home"], capture_output=True, timeout=5)
+        # That one if it outlived the screen, else another with windows,
+        # else 1: the panel stayed on the empty "mirror" (2026-11-20), which
+        # Sway then drops.
+        left = [w["name"] for w in sway("-t", "get_workspaces") or []
+                if w["name"] != "mirror"]
+        back = next((n for n in shown if n in left), left[0] if left else "")
+        subprocess.run(["swaymsg", "--", f'workspace "{back}"' if back else "workspace number 1"],
+                       capture_output=True, timeout=5)
+
+
+screen = None
+
+class Approval:
+    """A new viewer's address allowed from the phone (--approve, the stream
+    menu's Approval line), besides the key: a tap on the notification, or
+    a finger on the sensor (pro1x-fprintd, fprintd's D-Bus interface), within
+    a minute.  An address allowed stays allowed until the stream stops; one
+    refused waits a minute before it may ask again."""
+
+    NOTIFY = ("org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+              "org.freedesktop.Notifications")
+    FPRINT = "net.reactivated.Fprint"
+
+    def __init__(self, mode):
+        from gi.repository import Gio
+        self.Gio = Gio
+        self.mode = mode
+        # address: "waiting", "allowed", or refusal time.  The allowed ones
+        # are kept over a restart of the server (a new size, rate or fps):
+        # it asked again for each (author, 2026-11-19).
+        self.state = {ip: "allowed" for ip in
+                      os.environ.pop("WL_CAST_ALLOWED", "").split(",") if ip}
+        self.session = Gio.bus_get_sync(Gio.BusType.SESSION)
+
+    def check(self, ip):
+        """allowed, waiting or refused; a new address starts its question."""
+        st = self.state.get(ip)
+        if st == "allowed" or st == "waiting":
+            return st
+        if isinstance(st, float) and time.monotonic() - st < 60:
+            return "refused"
+        self.state[ip] = "waiting"
+        GLib.idle_add(self.ask, ip)
+        return "waiting"
+
+    def answer(self, ip, ok):
+        if self.state.get(ip) != "waiting":
+            return
+        self.state[ip] = "allowed" if ok else time.monotonic()
+        log_line(f"viewer {ip} " + ("allowed" if ok else "refused") + " on the phone")
+
+    def notify(self, body, actions, seconds=60):
+        try:
+            reply = self.session.call_sync(
+                *self.NOTIFY, "Notify",
+                GLib.Variant("(susssasa{sv}i)", (
+                    "Stream", 0, "", "Stream viewer", body, actions,
+                    {"urgency": GLib.Variant("y", 2)}, seconds * 1000)),
+                None, 0, -1, None)
+            return reply.unpack()[0]
+        except GLib.Error as e:
+            log_line(f"no notification: {e.message}")
+            return None
+
+    def close(self, nid):
+        if nid is None:
+            return
+        try:
+            self.session.call_sync(*self.NOTIFY, "CloseNotification",
+                                   GLib.Variant("(u)", (nid,)), None, 0, -1, None)
+        except GLib.Error:
+            pass
+
+    def ask(self, ip):
+        if self.mode == "fingerprint" and self.ask_finger(ip):
+            return GLib.SOURCE_REMOVE
+        # A tap (mako's default action) allows; dismissed or a minute
+        # gone, refused.
+        nid = self.notify(f"{ip} wants to watch and control the Pro\u00b9x: tap to allow",
+                          ["default", "Allow"])
+        if nid is None:
+            self.answer(ip, False)
+            return GLib.SOURCE_REMOVE
+        subs = []
+
+        def done(ok):
+            for sub in subs:
+                self.session.signal_unsubscribe(sub)
+            subs.clear()
+            self.answer(ip, ok)
+
+        def invoked(_c, _s, _p, _i, _sig, params):
+            got, action = params.unpack()
+            if got == nid and subs:
+                done(action == "default")
+
+        def closed(_c, _s, _p, _i, _sig, params):
+            if params.unpack()[0] == nid and subs:
+                done(False)
+        subs.append(self.session.signal_subscribe(
+            self.NOTIFY[0], self.NOTIFY[2], "ActionInvoked", self.NOTIFY[1], None, 0, invoked))
+        subs.append(self.session.signal_subscribe(
+            self.NOTIFY[0], self.NOTIFY[2], "NotificationClosed", self.NOTIFY[1], None, 0, closed))
+        GLib.timeout_add_seconds(65, lambda: subs and done(False) or False)
+        return GLib.SOURCE_REMOVE
+
+    def ask_finger(self, ip):
+        """The sensor, within a minute; False if it cannot be asked (then a
+        tap instead)."""
+        Gio = self.Gio
+        try:
+            system = Gio.bus_get_sync(Gio.BusType.SYSTEM)
+            manager = Gio.DBusProxy.new_sync(
+                system, 0, None, self.FPRINT, "/net/reactivated/Fprint/Manager",
+                self.FPRINT + ".Manager", None)
+            path = manager.call_sync("GetDefaultDevice", None, 0, -1, None).unpack()[0]
+            device = Gio.DBusProxy.new_sync(system, 0, None, self.FPRINT, path,
+                                            self.FPRINT + ".Device", None)
+            device.call_sync("Claim", GLib.Variant("(s)", ("",)), 0, -1, None)
+        except GLib.Error as e:
+            log_line(f"no fingerprint: {e.message}")
+            return False
+        nid = self.notify(f"{ip} wants to watch and control the Pro\u00b9x: "
+                          "touch the fingerprint sensor to allow", [])
+        tries = [0]
+
+        def finish(ok):
+            if self.state.get(ip) != "waiting":
+                return
+            try:
+                device.call_sync("VerifyStop", None, 0, -1, None)
+            except GLib.Error:
+                pass
+            try:
+                device.call_sync("Release", None, 0, -1, None)
+            except GLib.Error:
+                pass
+            self.close(nid)
+            self.answer(ip, ok)
+
+        def buzz(event):
+            # As the lock screen (gtklock-fingerprint): feedbackd's events,
+            # one buzz for a match, two for a miss; fbcli ends its feedback
+            # when its input ends.
+            try:
+                subprocess.Popen(["sh", "-c", f"sleep 1 | fbcli -E {event} >/dev/null 2>&1"],
+                                 stdin=subprocess.DEVNULL)
+            except OSError:
+                pass
+
+        def status(_proxy, _sender, signal_name, params):
+            if signal_name != "VerifyStatus":
+                return
+            result, done = params.unpack()
+            if result == "verify-match":
+                buzz("fingerprint-match")
+                finish(True)
+                return
+            if result == "verify-no-match":
+                buzz("fingerprint-nomatch")
+            if done:
+                tries[0] += 1
+                if tries[0] >= 3:
+                    finish(False)
+                else:
+                    try:
+                        device.call_sync("VerifyStart", GLib.Variant("(s)", ("any",)), 0, -1, None)
+                    except GLib.Error:
+                        finish(False)
+        device.connect("g-signal", status)
+        try:
+            device.call_sync("VerifyStart", GLib.Variant("(s)", ("any",)), 0, -1, None)
+        except GLib.Error as e:
+            log_line(f"no fingerprint: {e.message}")
+            finish(False)
+            return True
+        GLib.timeout_add_seconds(60, lambda: finish(False) or False)
+        return True
+
+
+approval = None
+
+
+# HTTPS beside HTTP (--tls PORT), for browsers that refuse plain HTTP: a
+# certificate browsers trust when the owner put one in
+# /var/lib/wl-cast/tls (cert.pem, key.pem readable by the user), else
+# one of the phone's own, made on first use and kept, for its addresses
+# (self-signed: the browser warns once; some refuse it).
+CERT = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+                    "wl-cast", "cert.pem")
+CERT_KEY = CERT.replace("cert.pem", "key.pem")
+
+
+# A certificate browsers trust, when the owner put one there.
+TRUSTED = "/var/lib/wl-cast/tls"
+
+
+def certificate():
+    """The certificate and key files: the trusted ones if readable, else the
+    phone's own, made if missing."""
+    cert, key = os.path.join(TRUSTED, "cert.pem"), os.path.join(TRUSTED, "key.pem")
+    if os.access(cert, os.R_OK) and os.access(key, os.R_OK):
+        return cert, key
+    if os.path.exists(CERT) and os.path.exists(CERT_KEY):
+        return CERT, CERT_KEY
+    os.makedirs(os.path.dirname(CERT), exist_ok=True)
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show", "scope", "global"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        out = ""
+    addresses = {"10.42.0.1", "127.0.0.1"} | {
+        line.split()[3].split("/")[0] for line in out.splitlines() if len(line.split()) > 3}
+    names = ",".join(["DNS:localhost"] + [f"IP:{a}" for a in sorted(addresses)])
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                    "-days", "3650", "-subj", "/CN=wl-cast",
+                    "-addext", f"subjectAltName={names}",
+                    "-keyout", CERT_KEY, "-out", CERT],
+                   capture_output=True, timeout=60, check=True)
+    os.chmod(CERT_KEY, 0o600)
+    log_line("stream certificate made: " + names)
+    return CERT, CERT_KEY
+
+
+def serve_tls(port):
+    """The same pages and offers over HTTPS on PORT."""
+    import ssl
+    cert, key = certificate()
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert, key)
+    server = make_server(port)
+    # The handshake in the request's thread, not in the one accepting.
+    server.socket = context.wrap_socket(server.socket, server_side=True,
+                                        do_handshake_on_connect=False)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+
+POWERSAVE = "/run/current-system/profile/bin/pro1x-wifi-powersave"
+# Guix's setuid sudo; the profile's own is not setuid.
+SUDO = "/run/privileged/bin/sudo" if os.path.exists("/run/privileged/bin/sudo") else "sudo"
+wifi_held = [False]
+
+
+def wifi_hold(on):
+    """Wi-Fi power saving off while the stream runs (the page's INFO
+    checkbox, on by default), and back as it was after."""
+    if on == wifi_held[0]:
+        return
+    try:
+        done = subprocess.run([SUDO, "-n", POWERSAVE, "hold" if on else "release"],
+                              timeout=10, stdin=subprocess.DEVNULL, capture_output=True)
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    if done.returncode == 0:
+        wifi_held[0] = on
+        log_line("Wi-Fi power saving " + ("off while streaming" if on else "as before"))
+    else:
+        log_line("Wi-Fi power saving unchanged: " + done.stderr.decode(errors="replace").strip()[:120])
+
+
+def wifi_powersave():
+    """on or off, or None without Wi-Fi."""
+    try:
+        out = subprocess.run(["iw", "dev", "wlan0", "get", "power_save"], timeout=5,
+                             capture_output=True, text=True).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return out.split()[-1] if out.strip() else None
+
+
+def kept_setting(name, default):
+    """A setting the page kept on the phone (SETTINGS), or DEFAULT."""
+    try:
+        with open(SETTINGS) as f:
+            return json.load(f).get(name, default)
+    except (OSError, ValueError, AttributeError):
+        return default
+
+
+class Producer:
+    """The portal's capture and the encoder, made once for the server's
+    life; each viewer's pipeline takes its H.264 from here (attach), from
+    the next keyframe.  Opening and closing a portal session and an encoder
+    for each viewer powered the phone off, as one closed and the next
+    opened (2026-11-18, four times, also with a session per viewer and 3 s
+    between them); the test programs, which opened both once per run, never
+    did.  A new bit rate, size or frame rate starts the whole server again
+    (reexec) rather than the encoder alone.
+
+    The portal sends a frame only when the screen changes, and the encoder
+    makes a keyframe only from a frame: a viewer joining a still screen got
+    no picture, and the page fell back to VP8 (author, 2026-11-19).  Its
+    frames also come unevenly, as the screen changes, and the picture
+    jerked (author: it should be as steady as a game or a film).  So the
+    capture and the encoder are two pipelines, and a clock (pace) hands the
+    encoder the latest frame at exactly the chosen rate, again when nothing
+    changed: up to one frame's time later, but even.  Without it (the
+    page's "steady" off), frames go as they come: the encoder works only
+    when the screen changes, and the phone stays cooler."""
+
+    # The profile and level as hardware() sets them, for the offer's
+    # profile-level-id.
+    CAPS = ("video/x-h264,stream-format=byte-stream,alignment=au,"
+            "profile=constrained-baseline,level=(string)4")
+
+    def __init__(self, portal, size, mbps):
+        self.portal, self.mbps = portal, mbps
+        self.lock = threading.Lock()
+        self.viewers = {}          # appsrc: still waiting for a keyframe
+        self.direct = {}           # send(data, key): still waiting, as above
+        self.asked_key = 0.0
+        self.last = None
+        self.fps = int(size.split("@")[1])
+        self.limit = self.fps      # lowered while the viewer loses packets
+        self.heat_cap = None       # lowered by the heat limit, in place
+        self.caps = None           # the frames' caps the encoder was made for
+        self.restarting = False
+        self.entered = {}          # pts: when the frame entered the encoder
+        self.bench = {"portal": [], "captured": [], "gpu": [], "encoded": [], "encoder": []}
+        self.vinfo = (None, None)  # caps, GstVideo.VideoInfo
+        self.adaptive = kept_setting("adaptive", True)
+        self.paused = False        # the viewer's PAUSE: no frames encoded
+        self.calm = 0              # loss checks since the last loss
+        self.steady = kept_setting("steady", True)
+        self.pushed_at = 0.0
+        self.size = size
+        self.pipeline = Gst.parse_launch(
+            "appsrc name=in is-live=true format=time do-timestamp=true "
+            "leaky-type=downstream max-buffers=1 ! "
+            f"{hardware(size, parse=False, mbps=mbps)} ! "
+            f"{self.CAPS} ! appsink name=out emit-signals=true sync=false "
+            "max-buffers=4 drop=true")
+        self.input = self.pipeline.get_by_name("in")
+        self.encoder = self.pipeline.get_by_name("enc")
+        self.pipeline.get_by_name("out").connect("new-sample", self.sample)
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", lambda _b, m: log_line(
+            f"encoder error: {m.parse_error()[0].message}"))
+        self.keyframes = keep_keyframes(self.pipeline)
+        # Frames a second from PipeWire, out of the GPU and out of the
+        # encoder, in the log every 10 s.
+        self.counts = {"portal": 0, "gpu": 0, "encoded": 0, "held": 0}
+        self.bytes = 0
+        self.pipeline.get_by_name("out").get_static_pad("sink").add_probe(
+            Gst.PadProbeType.BUFFER, self.count, "encoded")
+        self.encoder.get_static_pad("sink").add_probe(
+            Gst.PadProbeType.BUFFER, self.entering)
+        GLib.timeout_add_seconds(10, self.report)
+        self.pipeline.set_state(Gst.State.PLAYING)
+        self.capture = None
+        self.start_capture()
+        self.watcher = GLib.timeout_add_seconds(2, self.watch)
+        self.running = True
+        threading.Thread(target=self.pace, daemon=True).start()
+
+    def start_capture(self):
+        """A portal session and the pipeline from its frames to NV12 (the
+        encoder's pipeline stays): at the start, and again when it stalls."""
+        self.portal.open()
+        self.capture = Gst.parse_launch(
+            "identity name=frames ! appsink name=raw emit-signals=true sync=false "
+            "max-buffers=1 drop=true")
+        self.portal.video(self.capture, self.size, self.capture.get_by_name("frames"))
+        self.capture.get_by_name("raw").connect("new-sample", self.frame)
+        bus = self.capture.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", lambda _b, m: log_line(
+            f"capture error: {m.parse_error()[0].message}"))
+        for name, pad in (("portal", self.capture.get_by_name("pw").get_static_pad("src")),
+                          ("gpu", self.capture.get_by_name("raw").get_static_pad("sink"))):
+            pad.add_probe(Gst.PadProbeType.BUFFER, self.count, name)
+        if PW_SYNC:
+            self.capture.get_by_name("pw").get_static_pad("src").add_probe(
+                Gst.PadProbeType.BUFFER, self.written)
+        if BENCH:
+            self.capture.get_by_name("pw").get_static_pad("src").add_probe(
+                Gst.PadProbeType.BUFFER, self.bench_portal)
+        self.started_at = time.monotonic()
+        self.frame_at = 0.0
+        self.capture.set_state(Gst.State.PLAYING)
+
+    def watch(self):
+        """A capture that never got a frame (4 s), or none for 75 s (the
+        bar's clock changes every minute), starts again.  Its portal session
+        could stay without buffers from its start, the back end dropping
+        every frame ("out of buffers", 30 a second for 40 s, 2026-11-19)."""
+        now = time.monotonic()
+        if ((not self.frame_at and now - self.started_at > 4)
+                or (self.frame_at and now - self.frame_at > 75)):
+            log_line("capture stalled: its portal session again")
+            self.capture.set_state(Gst.State.NULL)
+            self.portal.close()
+            time.sleep(0.5)
+            self.start_capture()
+        return GLib.SOURCE_CONTINUE
+
+    def rate(self):
+        """Frames a second now: the chosen rate, lowered by losses
+        (adaptive) and by the heat limit."""
+        return min(self.limit, self.heat_cap or self.limit)
+
+    def frame(self, sink):
+        """A new frame of the screen: to the encoder at once, unless one
+        went less than 0.9 frame ago (then the clock takes the latest at
+        its next tick).  Steady too: waiting for the tick cost up to a
+        frame of delay (33 ms at 30 fps); the clock only repeats the last
+        frame when the screen sends none."""
+        sample = sink.emit("pull-sample")
+        caps = sample.get_caps()
+        if self.last is None:
+            self.input.set_caps(caps)
+            self.caps = caps.to_string()
+        elif caps.to_string() != self.caps and not self.restarting:
+            # A new frame size (Sway's scale changed on the captured
+            # output): the encoder was made for the old one and stalled
+            # until the stream was started again (author, 2026-11-20).
+            self.restarting = True
+            log_line(f"capture size changed ({caps.get_structure(0).get_value('width')}x"
+                     f"{caps.get_structure(0).get_value('height')}): starting again")
+            GLib.idle_add(lambda: restart_session() and False)
+        self.last = sample.get_buffer()
+        self.frame_at = time.monotonic()
+        if BENCH:
+            age = self.bench_age(self.last, caps)
+            if age is not None:
+                self.bench["captured"].append(age)
+            # From PipeWire's handover (pipewiresrc's timestamp) to here:
+            # the GPU stage; the rest of "captured" is Sway and the portal.
+            clock = self.capture.get_clock()
+            if clock and self.last.pts != Gst.CLOCK_TIME_NONE:
+                self.bench["gpu"].append(
+                    (clock.get_time() - self.capture.get_base_time() - self.last.pts) / 1e6)
+        if (not self.paused
+                and time.monotonic() - self.pushed_at >= 0.9 / self.rate()):
+            if self.held():
+                self.counts["held"] += 1
+            else:
+                self.push(self.last)
+        return Gst.FlowReturn.OK
+
+    def held(self):
+        """A DIRECT viewer's network behind: no new frame for the encoder
+        until it catches up (DirectViewer)."""
+        with self.lock:
+            sends = list(self.direct)
+        return any(getattr(send, "__self__", None) is not None
+                   and send.__self__.behind() for send in sends)
+
+    def push(self, buf):
+        copy = buf.copy()
+        copy.pts = copy.dts = copy.duration = Gst.CLOCK_TIME_NONE
+        self.input.emit("push-buffer", copy)
+        self.pushed_at = time.monotonic()
+
+    def pace(self):
+        """The latest frame to the encoder every 1/fps s, on a schedule that
+        does not drift; a late tick is skipped rather than made up.  Not
+        steady: only the last frame again for a viewer waiting for its
+        keyframe on a still screen (the encoder makes one only from a
+        frame)."""
+        due = time.monotonic()
+        while self.running:
+            step = 1 / self.rate()
+            due += step
+            wait = due - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            elif wait < -step:
+                due = time.monotonic()
+            buf = self.last
+            if buf is None or self.paused or self.held():
+                continue
+            # Steady: the last frame again only if none went this tick.
+            if self.steady:
+                if time.monotonic() - self.pushed_at >= 0.9 * step:
+                    self.push(buf)
+            elif time.monotonic() - self.pushed_at > 0.5:
+                with self.lock:
+                    waiting = any(self.viewers.values())
+                if waiting:
+                    self.push(buf)
+
+    def loss(self, fraction):
+        """The viewer's share of packets lost (its receiver reports, every
+        few seconds): above 3%, a quarter fewer frames, down to 5 a second;
+        after 10 s under 0.5%, 2 more, up to the fps chosen.  The bit rate
+        falls with the frames (the encoder budgets each frame), which the
+        encoder's own rate could not do: changing it while running killed
+        its firmware.  As Parsec and Shadow lower their rate on loss.  Off
+        (SET's adaptive): the fps chosen whatever the losses."""
+        if not self.adaptive:
+            return
+        if fraction > 0.03:
+            self.calm = 0
+            limit = max(5, int(self.limit * 0.75))
+        elif fraction < 0.005:
+            self.calm += 1
+            if self.calm < 5:
+                return
+            self.calm = 0
+            limit = min(self.fps, self.limit + 2)
+        else:
+            self.calm = 0
+            return
+        if limit != self.limit:
+            log_line(f"viewer lost {fraction:.0%} of packets: {limit} fps")
+            self.limit = limit
+
+    def count(self, _pad, info, name):
+        self.counts[name] += 1
+        if name == "encoded":
+            self.bytes += info.get_buffer().get_size()
+        return Gst.PadProbeReturn.OK
+
+    def report(self):
+        log_line("frames/s: " + ", ".join(f"{k} {v / 10:.1f}" for k, v in self.counts.items())
+                 + f"; encoded {self.bytes * 8 / 10e6:.1f} Mbit/s")
+        self.counts = dict.fromkeys(self.counts, 0)
+        self.bytes = 0
+        with self.lock:
+            bench = {k: sorted(v) for k, v in self.bench.items()}
+            for v in self.bench.values():
+                v.clear()
+        if any(bench.values()):
+            log_line("delay ms (median/worst): " + ", ".join(
+                f"{k} {v[len(v) // 2]:.0f}/{v[-1]:.0f}" for k, v in bench.items() if v))
+        return GLib.SOURCE_CONTINUE
+
+    def entering(self, _pad, info):
+        """When each frame enters the encoder, by its timestamp: the
+        encoder's own delay is measured on the frame that comes out."""
+        buf = info.get_buffer()
+        value = (self.bench_value(buf, Gst.Caps.from_string(self.caps))
+                 if BENCH and self.caps else None)
+        with self.lock:
+            self.entered[buf.pts] = (time.monotonic(), value)
+            if len(self.entered) > 64:
+                del self.entered[next(iter(self.entered))]
+        return Gst.PadProbeReturn.OK
+
+    def bench_value(self, buf, caps):
+        """The phone's clock (ms modulo 2^24) that scripts/stream-bench's
+        test window drew on this NV12 frame, or None: 25 blocks across (24
+        bits, then the phase that inverts them every other second), at
+        17.5% of the height and the same inverted at 32.5%."""
+        if self.vinfo[0] != caps.to_string():
+            self.vinfo = (caps.to_string(), GstVideo.VideoInfo.new_from_caps(caps))
+        vi = self.vinfo[1]
+        if vi is None:
+            return None
+        w, h, stride = vi.width, vi.height, vi.stride[0]
+        # Two rows only: a map from Python copies the whole frame, out of
+        # gldownload's uncached memory, which held the GPU stage to 6 of
+        # its 18 frames a second (2026-11-20).
+        ra = buf.extract_dup(int(h * 0.175) * stride, w)
+        rb = buf.extract_dup(int(h * 0.325) * stride, w)
+        v = 0
+        for i in range(25):
+            x = int(w * (0.02 + 0.96 * (i + 0.5) / 25))
+            if abs(ra[x] - rb[x]) < 60:
+                return None
+            v = v * 2 + (ra[x] > rb[x])
+        return (v >> 1) ^ (0xffffff if v & 1 else 0)
+
+    def written(self, _pad, info):
+        """Waits until the compositor's copy into this frame has run: its
+        DMA-BUF reads as ready once its writer (the GPU) is done.  wlroots
+        sends "ready" as soon as it has queued the copy on the GPU; read at
+        once, the buffer still held its previous frame, one turn of the
+        portal's buffers earlier (about 400 ms, 2026-11-20)."""
+        buf = info.get_buffer()
+        start = time.monotonic()
+        if PW_WAIT_MS:
+            time.sleep(PW_WAIT_MS / 1000)
+            return Gst.PadProbeReturn.OK
+        for i in range(buf.n_memory()):
+            mem = buf.peek_memory(i)
+            if GstAllocators.is_dmabuf_memory(mem):
+                fd = GstAllocators.dmabuf_memory_get_fd(mem)
+                p = select.poll()
+                p.register(fd, select.POLLIN)
+                p.poll(100)
+        if BENCH:
+            with self.lock:
+                self.bench.setdefault("written", []).append(
+                    (time.monotonic() - start) * 1000)
+        return Gst.PadProbeReturn.OK
+
+    def bench_portal(self, pad, info):
+        """The clock's age in the portal's own frame, before the GPU: the
+        output's buffer, not turned (XR24, linear), read a pixel per block
+        in each of the two ways it may be turned."""
+        buf = info.get_buffer()
+        caps = pad.get_current_caps()
+        meta = GstVideo.buffer_get_video_meta(buf)
+        if caps is None:
+            return Gst.PadProbeReturn.OK
+        st = caps.get_structure(0)
+        bw, bh = st.get_value("width"), st.get_value("height")
+        stride = meta.stride[0] if meta else bw * 4
+        W, H = max(bw, bh), min(bw, bh)
+        def px(bx, by):
+            b = buf.extract_dup(by * stride + bx * 4 + 1, 1)
+            return b[0] if b else 0
+        for turn in (lambda X, Y: (Y, W - 1 - X), lambda X, Y: (H - 1 - Y, X)):
+            v, ok = 0, True
+            for i in range(25):
+                X = int(W * (0.02 + 0.96 * (i + 0.5) / 25))
+                a, b = px(*turn(X, int(H * 0.175))), px(*turn(X, int(H * 0.325)))
+                if abs(a - b) < 60:
+                    ok = False
+                    break
+                v = v * 2 + (a > b)
+            if ok:
+                v = (v >> 1) ^ (0xffffff if v & 1 else 0)
+                d = time.time_ns() // 1_000_000 % (1 << 24) - v
+                with self.lock:
+                    self.bench["portal"].append(d + (1 << 24) if d < -(1 << 23) else d)
+                break
+        return Gst.PadProbeReturn.OK
+
+    def bench_age(self, buf, caps):
+        v = self.bench_value(buf, caps)
+        if v is None:
+            return None
+        d = time.time_ns() // 1_000_000 % (1 << 24) - v
+        return d + (1 << 24) if d < -(1 << 23) else d
+
+    def sample(self, sink):
+        buf = sink.emit("pull-sample").get_buffer()
+        key = not buf.has_flags(Gst.BufferFlags.DELTA_UNIT)
+        with self.lock:
+            viewers = [src for src, waiting in self.viewers.items()
+                       if key or not waiting]
+            for src in viewers:
+                self.viewers[src] = False
+            direct = [send for send, waiting in self.direct.items()
+                      if key or not waiting]
+            for send in direct:
+                self.direct[send] = False
+        for src in viewers:
+            # Timed by each viewer's pipeline as it arrives (do-timestamp).
+            copy = buf.copy()
+            copy.pts = copy.dts = copy.duration = Gst.CLOCK_TIME_NONE
+            src.emit("push-buffer", copy)
+        # The encoder's delay: from this frame's way in (by its timestamp).
+        with self.lock:
+            entered = self.entered.pop(buf.pts, None)
+        enc_ms = int(1000 * (time.monotonic() - entered[0])) if entered else 0
+        if BENCH and entered:
+            with self.lock:
+                self.bench["encoder"].append(enc_ms)
+            if entered[1] is not None:
+                d = time.time_ns() // 1_000_000 % (1 << 24) - entered[1]
+                with self.lock:
+                    self.bench["encoded"].append(d + (1 << 24) if d < -(1 << 23) else d)
+        if direct:
+            ok, info = buf.map(Gst.MapFlags.READ)
+            data = bytes(info.data) if ok else b""
+            if ok:
+                buf.unmap(info)
+            for send in direct:
+                # Behind (or not open yet): nothing more until a keyframe.
+                if not send(data, key, enc_ms):
+                    with self.lock:
+                        if send in self.direct:
+                            self.direct[send] = True
+                    self.keyframe_soon()
+        return Gst.FlowReturn.OK
+
+    def keyframe_soon(self):
+        """keyframe() from a streaming thread, at most once a second: each
+        skip asked for one, keyframes (850 kB) filled the link, which made
+        more skips (35 Mbit/s out of a 7 Mbit/s encoder, 2026-11-20).  The
+        page asks again every second while it waits."""
+        now = time.monotonic()
+        if now - self.asked_key >= 1.0:
+            self.asked_key = now
+            GLib.idle_add(lambda: self.keyframe() and False)
+
+    def attach_direct(self, send):
+        """A viewer that decodes the H.264 itself (the page's DIRECT mode):
+        SEND(data, key) gets each access unit from the next keyframe on,
+        and returns False when it could not take it."""
+        with self.lock:
+            self.direct[send] = True
+        self.keyframe()
+
+    def detach_direct(self, send):
+        with self.lock:
+            self.direct.pop(send, None)
+
+    def attach(self, src):
+        with self.lock:
+            self.viewers[src] = True
+        # The viewer's own requests (the browser's, after a loss) stop at
+        # its appsrc: passed on to the encoder.
+        src.get_static_pad("src").add_probe(
+            Gst.PadProbeType.EVENT_UPSTREAM,
+            lambda _p, info: (self.keyframe()
+                              if GstVideo.video_event_is_force_key_unit(info.get_event())
+                              else None) or Gst.PadProbeReturn.OK)
+        self.keyframe()
+
+    def keyframe(self):
+        """A keyframe from the encoder, from the next frame it gets."""
+        self.encoder.get_static_pad("src").send_event(
+            GstVideo.video_event_new_upstream_force_key_unit(
+                Gst.CLOCK_TIME_NONE, True, 0))
+        if not self.steady and self.last is not None:
+            self.push(self.last)
+
+    def detach(self, src):
+        with self.lock:
+            self.viewers.pop(src, None)
+
+    def stop(self):
+        if self.keyframes:
+            GLib.source_remove(self.keyframes)
+        self.running = False
+        GLib.source_remove(self.watcher)
+        self.capture.set_state(Gst.State.NULL)
+        self.last = None
+        self.pipeline.set_state(Gst.State.NULL)
+        self.portal.close()
+
+class Screencast(Producer):
+    """The screen to H.264 by wl-cast-capture (device/stream), with no CPU
+    copy of a pixel, as scrcpy does on Android: Sway copies the output into
+    the helper's GPU buffers, the GPU turns, scales and converts it to NV12
+    in Venus's own input buffers, and Venus encodes.  In place of the
+    portal, PipeWire, the GPU stage and the encoder pipeline of Producer,
+    whose frames were 0.4 s old before the encoder and which used more than
+    a core in copies; the helper took 4% of a core and 69 ms from Sway's
+    frame to the encoded one (2026-11-20).  The viewers are Producer's:
+    RTP pipelines (attach) and DIRECT pages (attach_direct).  While a
+    DIRECT page's network is behind, the helper copies no new frame (h, g
+    on its stdin); k asks it for a keyframe."""
+
+    HEAD = struct.Struct("<4sIBQQ")
+
+    def __init__(self, output, size, mbps):
+        self.portal, self.mbps = None, mbps
+        self.lock = threading.Lock()
+        self.viewers = {}
+        self.direct = {}
+        self.asked_key = 0.0
+        self.last = None
+        self.fps = int(size.split("@")[1])
+        self.limit = self.fps
+        self.heat_cap = None
+        self.caps = None
+        self.restarting = False
+        self.entered = {}
+        self.bench = {"encoder": []}
+        self.adaptive = kept_setting("adaptive", True)
+        self.paused = False
+        self.calm = 0
+        self.steady = False
+        self.pushed_at = 0.0
+        self.size = size
+        self.keyframes = None
+        self.counts = {"encoded": 0, "held": 0}
+        self.bytes = 0
+        self.headers = b""          # SPS and PPS, for later keyframes
+        self.holding = False
+        self.proc = subprocess.Popen(
+            [SCREENCAST, "-o", output, "-s", size.split("@")[0], "-r", str(self.fps),
+             "-b", str(int(mbps * 1e6))],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.running = True
+        threading.Thread(target=self.read, daemon=True).start()
+        threading.Thread(target=self.errors, daemon=True).start()
+        threading.Thread(target=self.watch_hold, daemon=True).start()
+        self.reporter = GLib.timeout_add_seconds(10, self.report)
+        log_line(f"capture and encoding by wl-cast-capture ({output})")
+
+    def tell(self, c):
+        try:
+            self.proc.stdin.write(c)
+            self.proc.stdin.flush()
+        except (OSError, ValueError):
+            pass
+
+    def errors(self):
+        for line in self.proc.stderr:
+            log_line("screencast: " + line.decode(errors="replace").rstrip())
+
+    def watch_hold(self):
+        """h while a DIRECT page's network is behind (or PAUSE), g after."""
+        while self.running:
+            hold = self.paused or self.held()
+            if hold != self.holding:
+                self.holding = hold
+                self.tell(b"h" if hold else b"g")
+            if hold:
+                self.counts["held"] += 1
+            time.sleep(0.02)
+
+    def read(self):
+        out = self.proc.stdout
+        while self.running:
+            head = out.read(self.HEAD.size)
+            if len(head) < self.HEAD.size:
+                break
+            magic, n, key, captured, done = self.HEAD.unpack(head)
+            data = out.read(n)
+            if magic != b"PXSC" or len(data) < n:
+                break
+            key = bool(key)
+            if key:
+                data = self.with_headers(data)
+            self.counts["encoded"] += 1
+            self.bytes += len(data)
+            enc_ms = max(0, (done - captured) // 1000)
+            with self.lock:
+                self.bench["encoder"].append(enc_ms)
+            self.deliver(data, key, enc_ms)
+        if self.running:
+            log_line(f"wl-cast-capture ended ({self.proc.poll()})")
+
+    def with_headers(self, data):
+        """Venus puts SPS and PPS only before the first keyframe; a viewer
+        joining later needs them before its own."""
+        nals = re.split(b"(?=\x00\x00\x00\x01)", data)
+        kinds = [x[4] & 0x1F for x in nals if len(x) > 4]
+        if 7 in kinds:
+            self.headers = b"".join(x for x in nals if len(x) > 4 and x[4] & 0x1F in (7, 8))
+            return data
+        return self.headers + data
+
+    def deliver(self, data, key, enc_ms):
+        with self.lock:
+            viewers = [src for src, waiting in self.viewers.items() if key or not waiting]
+            for src in viewers:
+                self.viewers[src] = False
+            direct = [send for send, waiting in self.direct.items() if key or not waiting]
+            for send in direct:
+                self.direct[send] = False
+        if viewers:
+            buf = Gst.Buffer.new_wrapped(data)
+            if not key:
+                buf.set_flags(Gst.BufferFlags.DELTA_UNIT)
+            for src in viewers:
+                src.emit("push-buffer", buf)
+        for send in direct:
+            if not send(data, key, enc_ms):
+                with self.lock:
+                    if send in self.direct:
+                        self.direct[send] = True
+                self.keyframe_soon()
+
+    def keyframe(self):
+        self.tell(b"k")
+
+    def report(self):
+        log_line("frames/s: " + ", ".join(f"{k} {v / 10:.1f}" for k, v in self.counts.items())
+                 + f"; encoded {self.bytes * 8 / 10e6:.1f} Mbit/s")
+        self.counts = dict.fromkeys(self.counts, 0)
+        self.bytes = 0
+        with self.lock:
+            enc = sorted(self.bench["encoder"])
+            self.bench["encoder"].clear()
+        if enc:
+            log_line(f"delay ms, Sway's frame to encoded (median/worst): "
+                     f"{enc[len(enc) // 2]}/{enc[-1]}")
+        return GLib.SOURCE_CONTINUE
+
+    def stop(self):
+        self.running = False
+        GLib.source_remove(self.reporter)
+        self.tell(b"q")
+        try:
+            self.proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+
+# wl-cast-capture, if installed (WL_CAST_SCREENCAST=0: the portal;
+# =PATH: that build of it).
+_sc = os.environ.get("WL_CAST_SCREENCAST", "1")
+SCREENCAST = (None if _sc == "0" else _sc if os.path.isfile(_sc)
+              else shutil.which("wl-cast-capture"))
+
+
+producer = None
+
+
+# The sound: what the phone plays (the default output's monitor, through
+# PipeWire's PulseAudio server), as Opus.  Blocks of 10 ms in a 40 ms buffer
+# underran, heard as buzzing and crackling (author, 2026-11-18): 20 ms blocks
+# in a 200 ms buffer, and 20 ms Opus frames, Opus's usual.  Some crackling
+# stayed: the source follows the pipeline's clock by retimestamping, not by
+# dropping or repeating samples (slave-method's default, skew, clicks).
+# 96 kbit/s with in-band FEC: cheaper on Wi-Fi, and a lost packet is rebuilt
+# from the next one rather than concealed.
+AUDIO = (
+    "pulsesrc device=@DEFAULT_MONITOR@ buffer-time=200000 latency-time=20000 "
+    "slave-method=re-timestamp ! valve name=av ! "
+    "audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! "
+    "opusenc bitrate=96000 frame-size=20 inband-fec=true packet-loss-percentage=5 ! "
+    "rtpopuspay pt=97 mtu=1200 ! "
+    "application/x-rtp,media=audio,encoding-name=OPUS,payload=97"
+)
+
+
+def keep_keyframes(pipeline, every=10):
+    """A full keyframe every EVERY s, to recover from a loss.  Each is a
+    burst of data: every 3 s they filled a weak Wi-Fi link (2026-11-19);
+    WebRTC viewers get lost packets again (NACK) and ask for a keyframe
+    when they need one, so 10 s will do.  The UDP stream has neither: 3 s."""
+    encoder = pipeline.get_by_name("enc")
+    if encoder is None:
+        return None
+
+    def ask():
+        encoder.get_static_pad("src").send_event(
+            GstVideo.video_event_new_upstream_force_key_unit(
+                Gst.CLOCK_TIME_NONE, True, 0
+            )
+        )
+        return GLib.SOURCE_CONTINUE
+
+    return GLib.timeout_add_seconds(every, ask)
+
+
+# Browser key positions (KeyboardEvent.code) to Linux key names.
+CODES = {**{f"Key{c}": f"KEY_{c}" for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
+         **{f"Digit{d}": f"KEY_{d}" for d in "0123456789"},
+         **{f"F{n}": f"KEY_F{n}" for n in range(1, 13)},
+         "Enter": "KEY_ENTER", "Backspace": "KEY_BACKSPACE", "Tab": "KEY_TAB",
+         "Escape": "KEY_ESC", "Space": "KEY_SPACE", "Delete": "KEY_DELETE",
+         "ArrowUp": "KEY_UP", "ArrowDown": "KEY_DOWN", "ArrowLeft": "KEY_LEFT",
+         "ArrowRight": "KEY_RIGHT", "Home": "KEY_HOME", "End": "KEY_END",
+         "PageUp": "KEY_PAGEUP", "PageDown": "KEY_PAGEDOWN",
+         "Minus": "KEY_MINUS", "Equal": "KEY_EQUAL",
+         "BracketLeft": "KEY_LEFTBRACE", "BracketRight": "KEY_RIGHTBRACE",
+         "Backslash": "KEY_BACKSLASH", "Semicolon": "KEY_SEMICOLON",
+         "Quote": "KEY_APOSTROPHE", "Comma": "KEY_COMMA", "Period": "KEY_DOT",
+         "Slash": "KEY_SLASH", "Backquote": "KEY_GRAVE",
+         # Captured keyboards also send these, down and up.
+         "ShiftLeft": "KEY_LEFTSHIFT", "ShiftRight": "KEY_RIGHTSHIFT",
+         "ControlLeft": "KEY_LEFTCTRL", "ControlRight": "KEY_RIGHTCTRL",
+         "AltLeft": "KEY_LEFTALT", "AltRight": "KEY_RIGHTALT",
+         "MetaLeft": "KEY_LEFTMETA", "MetaRight": "KEY_RIGHTMETA",
+         "OSLeft": "KEY_LEFTMETA", "OSRight": "KEY_RIGHTMETA",   # older Firefox
+         "CapsLock": "KEY_CAPSLOCK", "Insert": "KEY_INSERT",
+         "PrintScreen": "KEY_SYSRQ", "ContextMenu": "KEY_COMPOSE",
+         "IntlBackslash": "KEY_102ND"}
+# Typed text to keys on a US layout (the remote keyboard's, pro1x.conf).
+SHIFTED = dict(zip('~!@#$%^&*()_+{}|:"<>?', "`1234567890-=[]\\;',./"))
+PLAIN = {"`": "Backquote", "-": "Minus", "=": "Equal", "[": "BracketLeft",
+         "]": "BracketRight", "\\": "Backslash", ";": "Semicolon",
+         "'": "Quote", ",": "Comma", ".": "Period", "/": "Slash",
+         " ": "Space", "\n": "Enter", "\t": "Tab"}
+
+
+class Remote:
+    """The viewer's touches and keys on the Pro1x: an absolute pointer with
+    a wheel, mapped to the panel and turned with it by Sway like the
+    touchscreen (pro1x.conf), and a keyboard."""
+
+    def __init__(self, output=PANEL):
+        from evdev import AbsInfo, UInput, ecodes
+        self.e = ecodes
+        self.output = output
+        axis = AbsInfo(value=0, min=0, max=65535, fuzz=0, flat=0, resolution=0)
+        self.pointer = UInput(
+            {ecodes.EV_KEY: [ecodes.BTN_LEFT, ecodes.BTN_RIGHT],
+             ecodes.EV_ABS: [(ecodes.ABS_X, axis), (ecodes.ABS_Y, axis)],
+             ecodes.EV_REL: [ecodes.REL_WHEEL, ecodes.REL_HWHEEL]},
+            name="wl-cast-remote-pointer", vendor=0x1234, product=0x567A)
+        keys = sorted({getattr(ecodes, n) for n in CODES.values()}
+                      | {ecodes.KEY_LEFTSHIFT, ecodes.KEY_LEFTCTRL, ecodes.KEY_LEFTALT})
+        self.keyboard = UInput({ecodes.EV_KEY: keys},
+                               name="wl-cast-remote-keyboard",
+                               vendor=0x1234, product=0x567B)
+        slots = AbsInfo(value=0, min=0, max=9, fuzz=0, flat=0, resolution=0)
+        ids = AbsInfo(value=0, min=0, max=65535, fuzz=0, flat=0, resolution=0)
+        self.touch = UInput(
+            {ecodes.EV_KEY: [ecodes.BTN_TOUCH],
+             ecodes.EV_ABS: [(ecodes.ABS_X, axis), (ecodes.ABS_Y, axis),
+                             (ecodes.ABS_MT_SLOT, slots),
+                             (ecodes.ABS_MT_TRACKING_ID, ids),
+                             (ecodes.ABS_MT_POSITION_X, axis),
+                             (ecodes.ABS_MT_POSITION_Y, axis)]},
+            name="wl-cast-remote-touch", vendor=0x1234, product=0x567C,
+            input_props=[ecodes.INPUT_PROP_DIRECT])
+        # The touchpad mode and a captured mouse: moves from where the
+        # pointer is.
+        self.mouse = UInput(
+            {ecodes.EV_KEY: [ecodes.BTN_LEFT, ecodes.BTN_RIGHT, ecodes.BTN_MIDDLE],
+             ecodes.EV_REL: [ecodes.REL_X, ecodes.REL_Y]},
+            name="wl-cast-remote-mouse", vendor=0x1234, product=0x567D)
+        self.held = set()                   # captured keys down
+        self.rest = [0.0, 0.0]              # fractions of a move left over
+        self.slots, self.tracking = {}, 0
+        self.lock = threading.Lock()
+        self.turn, self.turn_at = "normal", 0.0
+        # As pro1x.conf says, also before Sway has read it again.
+        time.sleep(0.5)
+        for command in (f'input "4660:22140:wl-cast-remote-touch" map_to_output {output}',
+                        f'input "4660:22138:wl-cast-remote-pointer" map_to_output {output}',
+                        'input "4660:22139:wl-cast-remote-keyboard" xkb_layout us',
+                        'input "4660:22139:wl-cast-remote-keyboard" xkb_variant ""'):
+            subprocess.run(["swaymsg", command], capture_output=True, timeout=5)
+
+    def transform(self):
+        """The panel's turn, read again every few seconds."""
+        if time.monotonic() - self.turn_at > 3:
+            try:
+                outputs = json.loads(subprocess.run(
+                    ["swaymsg", "-t", "get_outputs", "-r"],
+                    capture_output=True, text=True, timeout=2).stdout)
+                self.turn = next(o["transform"] for o in outputs
+                                 if o.get("active") and o["name"] == self.output)
+            except (OSError, ValueError, StopIteration, subprocess.TimeoutExpired):
+                pass
+            self.turn_at = time.monotonic()
+        return self.turn
+
+    def place(self, x, y):
+        """A point of the picture (0 to 1, as shown) on the panel, which
+        Sway then turns: wlroots' output transform (types/wlr_cursor.c),
+        undone here.  Sway names its turns clockwise and wlroots
+        anticlockwise (sway/ipc-json.c), so Sway's "90" is wlroots' 270:
+        mixing them up mirrored the taps (author, 2026-11-18)."""
+        x, y = {"90": (1 - y, x), "180": (1 - x, 1 - y),
+                "270": (y, 1 - x)}.get(self.transform(), (x, y))
+        return int(x * 65535), int(y * 65535)
+
+    def at(self, x, y):
+        e = self.e
+        px, py = self.place(x, y)
+        self.pointer.write(e.EV_ABS, e.ABS_X, px)
+        self.pointer.write(e.EV_ABS, e.ABS_Y, py)
+
+    def touch_event(self, kind, ident, x=0.0, y=0.0):
+        """A finger of the viewer's on the virtual touchscreen: a slot for
+        each, as a real multi-touch screen reports them."""
+        e, t = self.e, self.touch
+        if kind == "tdown":
+            if ident in self.slots or len(self.slots) >= 10:
+                return
+            slot = min(set(range(10)) - set(self.slots.values()))
+            self.slots[ident] = slot
+            self.tracking += 1
+            t.write(e.EV_ABS, e.ABS_MT_SLOT, slot)
+            t.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, self.tracking)
+        elif ident not in self.slots:
+            return
+        else:
+            t.write(e.EV_ABS, e.ABS_MT_SLOT, self.slots[ident])
+        if kind in ("tdown", "tmove"):
+            px, py = self.place(x, y)
+            t.write(e.EV_ABS, e.ABS_MT_POSITION_X, px)
+            t.write(e.EV_ABS, e.ABS_MT_POSITION_Y, py)
+            t.write(e.EV_ABS, e.ABS_X, px)
+            t.write(e.EV_ABS, e.ABS_Y, py)
+            if kind == "tdown" and len(self.slots) == 1:
+                t.write(e.EV_KEY, e.BTN_TOUCH, 1)
+        else:
+            t.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, -1)
+            del self.slots[ident]
+            if not self.slots:
+                t.write(e.EV_KEY, e.BTN_TOUCH, 0)
+        t.syn()
+
+    def tap(self, key, shift=False, ctrl=False, alt=False):
+        e, kb = self.e, self.keyboard
+        mods = [m for m, on in ((e.KEY_LEFTSHIFT, shift), (e.KEY_LEFTCTRL, ctrl),
+                                (e.KEY_LEFTALT, alt)) if on]
+        for m in mods:
+            kb.write(e.EV_KEY, m, 1)
+        kb.write(e.EV_KEY, key, 1)
+        kb.syn()
+        kb.write(e.EV_KEY, key, 0)
+        for m in mods:
+            kb.write(e.EV_KEY, m, 0)
+        kb.syn()
+
+    # The Pro1x's menus and on-screen keyboard, as its swipes and keys open
+    # them (desktop.conf).
+    ACTIONS = {"quickactions": ["pro1x-menu", "toggle", "quickactions"],
+               "launcher": ["pro1x-menu", "toggle", "launcher"],
+               "windowswitcher": ["pro1x-menu", "toggle", "windowswitcher"],
+               "osk": ["pro1x-osk", "toggle"]}
+
+    def action(self, name):
+        if name == "osk" and self.output != PANEL:
+            threading.Thread(target=self.osk_here, daemon=True).start()
+            return
+        if name in self.ACTIONS:
+            # The menus open on the focused output: the viewer's.  With a
+            # screen of its own mirrored, the mirror on the panel had the
+            # focus, and the menus opened there, out of the stream
+            # (author, 2026-11-19).
+            if self.output != PANEL:
+                subprocess.run(["swaymsg", f"focus output {self.output}"],
+                               capture_output=True, timeout=5)
+            # Through Sway, in its session's environment: started from the
+            # server's, the launcher's terminal did not come up (2026-11-19).
+            subprocess.run(["swaymsg", "exec " + " ".join(self.ACTIONS[name])],
+                           capture_output=True, timeout=5)
+
+    def osk_here(self):
+        """The on-screen keyboard on the stream's own screen (pro1x-osk
+        moves stevia there, a second, when it is on the panel)."""
+        subprocess.run(["swaymsg", f"focus output {self.output}"],
+                       capture_output=True, timeout=5)
+        subprocess.run(["swaymsg", "exec pro1x-osk toggle stream"],
+                       capture_output=True, timeout=5)
+
+    def text(self, text):
+        for ch in text:
+            shift = ch.isupper() or ch in SHIFTED
+            base = SHIFTED.get(ch, ch.lower())
+            code = (f"Key{base.upper()}" if base.isalpha() and base.isascii()
+                    else f"Digit{base}" if base.isdigit() else PLAIN.get(base))
+            if code in CODES:
+                self.tap(getattr(self.e, CODES[code]), shift=shift)
+
+    def handle(self, message):
+        try:
+            m = json.loads(message)
+        except ValueError:
+            return
+        e, p = self.e, self.pointer
+        with self.lock:
+            kind = m.get("t")
+            if kind in ("tdown", "tmove", "tup"):
+                self.touch_event(kind, m.get("id"), m.get("x", 0.0), m.get("y", 0.0))
+                return
+            if kind == "action":
+                self.action(m.get("name"))
+                return
+            if kind == "rel":
+                mouse = self.mouse
+                for i, axis in enumerate((e.REL_X, e.REL_Y)):
+                    try:
+                        self.rest[i] += float(m.get(("dx", "dy")[i], 0))
+                    except (TypeError, ValueError):
+                        return
+                    step = int(self.rest[i])
+                    self.rest[i] -= step
+                    if step:
+                        mouse.write(e.EV_REL, axis, step)
+                mouse.syn()
+                return
+            if kind == "rbtn":
+                button = {"left": e.BTN_LEFT, "right": e.BTN_RIGHT,
+                          "middle": e.BTN_MIDDLE}.get(m.get("b"))
+                if button is not None:
+                    self.mouse.write(e.EV_KEY, button, 1 if m.get("d") else 0)
+                    self.mouse.syn()
+                return
+            if kind in ("kd", "ku") and m.get("code") in CODES:
+                key = getattr(e, CODES[m["code"]])
+                self.keyboard.write(e.EV_KEY, key, 1 if kind == "kd" else 0)
+                self.keyboard.syn()
+                (self.held.add if kind == "kd" else self.held.discard)(key)
+                return
+            if kind == "allup":
+                for key in self.held:
+                    self.keyboard.write(e.EV_KEY, key, 0)
+                self.keyboard.syn()
+                self.held.clear()
+                return
+            if kind == "move":
+                self.at(m["x"], m["y"])
+            elif kind in ("down", "up"):
+                if "x" in m:
+                    self.at(m["x"], m["y"])
+                p.write(e.EV_KEY, e.BTN_LEFT, 1 if kind == "down" else 0)
+            elif kind == "right":
+                p.write(e.EV_KEY, e.BTN_RIGHT, 1)
+                p.syn()
+                p.write(e.EV_KEY, e.BTN_RIGHT, 0)
+            elif kind == "scroll":
+                if "x" in m:
+                    self.at(m["x"], m["y"])
+                    p.syn()
+                if m.get("v"):
+                    p.write(e.EV_REL, e.REL_WHEEL, int(m["v"]))
+                if m.get("h"):
+                    p.write(e.EV_REL, e.REL_HWHEEL, int(m["h"]))
+            elif kind == "key" and m.get("code") in CODES:
+                self.tap(getattr(e, CODES[m["code"]]), m.get("shift"),
+                         m.get("ctrl"), m.get("alt"))
+            elif kind == "text":
+                self.text(str(m.get("text", ""))[:200])
+            p.syn()
+
+
+class PanelTouch:
+    """Client mode: the panel's own touches on the mirror (wl-mirror, fitted
+    with bars) played on the stream's screen, through the viewer's virtual
+    touchscreen (author, 2026-11-19).  The panel's touchscreen is taken from
+    Sway meanwhile, since Sway would play them on the panel, under the
+    mirror.  Its native axes are the panel's, turned as Sway turns the
+    panel (as Remote.place, undone), then out of the mirror's bars."""
+
+    NAME = "Goodix Capacitive TouchScreen"
+
+    def __init__(self, remote, size):
+        from evdev import InputDevice, ecodes, list_devices
+        self.remote, self.e = remote, ecodes
+        self.width, self.height = map(int, size.split("@")[0].split("x"))
+        self.device = next((d for d in map(InputDevice, list_devices())
+                            if d.name == self.NAME), None)
+        if self.device is None:
+            raise RuntimeError("no panel touchscreen")
+        self.maxx = self.device.absinfo(ecodes.ABS_MT_POSITION_X).max or 1
+        self.maxy = self.device.absinfo(ecodes.ABS_MT_POSITION_Y).max or 1
+        panel = next((o for o in sway("-t", "get_outputs") or [] if o["name"] == PANEL), {})
+        mode = panel.get("current_mode") or {"width": 1080, "height": 2160}
+        self.turn = panel.get("transform", "normal")
+        pw, ph = mode["width"], mode["height"]
+        self.panel = (ph, pw) if self.turn in ("90", "270") else (pw, ph)
+        self.device.grab()
+        self.slots, self.slot = {}, 0     # slot: [tracking id, x, y, down]
+        threading.Thread(target=self.read, daemon=True).start()
+        log_line("the panel's touches go to the stream's screen")
+
+    def at(self, rx, ry):
+        """A raw point: the picture's 0-1 point, or None in the bars."""
+        u, v = rx / self.maxx, ry / self.maxy
+        x, y = {"90": (v, 1 - u), "180": (1 - u, 1 - v),
+                "270": (1 - v, u)}.get(self.turn, (u, v))
+        pw, ph = self.panel
+        scale = min(pw / self.width, ph / self.height)
+        ox, oy = (pw - self.width * scale) / 2, (ph - self.height * scale) / 2
+        nx = (x * pw - ox) / (self.width * scale)
+        ny = (y * ph - oy) / (self.height * scale)
+        if not (0 <= nx <= 1 and 0 <= ny <= 1):
+            return None
+        return nx, ny
+
+    def read(self):
+        e = self.e
+        try:
+            for ev in self.device.read_loop():
+                if ev.type == e.EV_ABS:
+                    if ev.code == e.ABS_MT_SLOT:
+                        self.slot = ev.value
+                    else:
+                        st = self.slots.setdefault(self.slot, [-1, 0, 0, False])
+                        if ev.code == e.ABS_MT_TRACKING_ID:
+                            st[0] = ev.value
+                        elif ev.code == e.ABS_MT_POSITION_X:
+                            st[1] = ev.value
+                        elif ev.code == e.ABS_MT_POSITION_Y:
+                            st[2] = ev.value
+                elif ev.type == e.EV_SYN and ev.code == e.SYN_REPORT:
+                    self.report()
+        except OSError:
+            pass
+
+    def report(self):
+        with self.remote.lock:
+            for slot, st in self.slots.items():
+                ident = f"panel{slot}"
+                if st[0] >= 0:
+                    point = self.at(st[1], st[2])
+                    if point is None:
+                        continue
+                    self.remote.touch_event("tmove" if st[3] else "tdown", ident, *point)
+                    st[3] = True
+                elif st[3]:
+                    self.remote.touch_event("tup", ident)
+                    st[3] = False
+
+    def stop(self):
+        try:
+            self.device.ungrab()
+            self.device.close()
+        except OSError:
+            pass
+
+
+panel_touch = None
+remote = None
+LOG = os.path.join(os.environ.get("XDG_STATE_HOME")
+                   or os.path.expanduser("~/.local/state"),
+                   "wl-cast", "stream.log")
+# The page's settings and modes, kept on the phone for any browser.
+SETTINGS = os.path.join(os.path.dirname(LOG), "stream.json")
+# WL_CAST_BENCH=1: with scripts/stream-bench's test window on the
+# screen, the log gives each stage's delay every 10 s.
+BENCH = os.environ.get("WL_CAST_BENCH") == "1"
+# WL_CAST_PW_SYNC=1: wait for the compositor's copy into each frame
+# (Producer.written).  Tried once: the first frame was 195 ms old instead
+# of 400, then the portal sent no more (2026-11-20).  Off by default.
+PW_SYNC = os.environ.get("WL_CAST_PW_SYNC") == "1"
+# WL_CAST_PW_WAIT_MS=N (with PW_SYNC): a plain wait instead, a test.
+PW_WAIT_MS = int(os.environ.get("WL_CAST_PW_WAIT_MS", "0"))
+if PW_SYNC:
+    gi.require_version("GstAllocators", "1.0")
+    from gi.repository import GstAllocators  # noqa: E402
+
+
+def log_line(text):
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + text.strip() + "\n")
+
+
+class Session:
+    """One viewer: the capture command, the pipeline, and its offer."""
+
+    def __init__(self, command, codec, size, mbps=6.0, direct=False):
+        self.mbps = mbps
+        self.video_channel = None   # DIRECT: the RTP video closed after the offer
+        self.offer_ready = threading.Event()
+        self.offer = None
+        self.producer = producer if codec == "h264" and size else None
+        self.proc = (None if self.producer
+                     else subprocess.Popen(command, stdout=subprocess.PIPE))
+        # RTP packets of at most 1200 bytes, as WebRTC usually sends: the
+        # payloaders' 1400 did not fit through Tailscale (MTU 1280), where
+        # only the input came through and the video stayed black.
+        payload = {
+            "h264": ("" if self.producer
+                     else (hardware(size, mbps=mbps) if size
+                           else "h264parse config-interval=-1") + " ! ")
+                    + "valve name=vv ! rtph264pay config-interval=-1 pt=96 mtu=1200 ! "
+                    "application/x-rtp,media=video,encoding-name=H264,payload=96"
+                    # The phone's encoder: constrained baseline, level 4.  The
+                    # offer had no profile-level-id, which browsers read as
+                    # level 3.1, too low for 1920x960.
+                    + (",profile-level-id=(string)42c028,packetization-mode=(string)1"
+                       if size else ""),
+            "vp8": "ivfparse ! valve name=vv ! rtpvp8pay pt=96 mtu=1200 ! "
+                   "application/x-rtp,media=video,encoding-name=VP8,payload=96",
+        }[codec]
+        self.pipeline = Gst.parse_launch(
+            (f"appsrc name=frames is-live=true format=time do-timestamp=true "
+             f"leaky-type=downstream max-buffers=4 caps={Producer.CAPS}"
+             if self.producer
+             else raw_source(self.proc.stdout.fileno(), size) if size
+             else f"fdsrc fd={self.proc.stdout.fileno()}")
+            + f" ! {payload} ! "
+            "webrtcbin name=w bundle-policy=max-bundle latency=0 "
+            + AUDIO + " ! w."
+        )
+        self.webrtc = self.pipeline.get_by_name("w")
+        # Picture and sound as two streams: in one, the browser lip-synced
+        # them, and with the picture's timestamps counted from frames and the
+        # sound's from its clock, it held the sound back 1.5 s and cut it
+        # now and then (author, 2026-11-18).  Apart, each plays as it comes;
+        # the page's a/v setting lines them up.
+        for i, pad in enumerate(self.webrtc.sinkpads):
+            if pad.find_property("msid"):
+                pad.set_property("msid", f"wl-cast-{i}")
+        # A video packet lost on the Wi-Fi is sent again when the browser
+        # asks (NACK, RTX): without it each loss cost frames until the next
+        # keyframe, and the picture jerked at a steady 20 fps from the
+        # encoder (2026-11-19).
+        # Recovery packets (ULP FEC in RED) only with VP8: with H.264 the
+        # author's Firefox showed no picture (2026-11-19), and browsers take
+        # ULP FEC reliably with VP8 only.
+        video = self.webrtc.emit("get-transceiver", 0)
+        if video is not None:
+            video.set_property("do-nack", True)
+            if codec == "vp8":
+                video.set_property("fec-type", GstWebRTC.WebRTCFECType.ULP_RED)
+                video.set_property("fec-percentage", 20)
+        self.webrtc.connect("on-negotiation-needed", self.negotiate)
+        self.webrtc.connect("notify::ice-gathering-state", self.gathering)
+        self.webrtc.connect("notify::ice-connection-state", self.connection)
+        self.keyframes = keep_keyframes(self.pipeline)
+        self.losses = (GLib.timeout_add_seconds(2, self.ask_loss)
+                       if self.producer else None)
+        if remote:
+            # The viewer's input, in the same connection, made before the
+            # offer so that the offer carries it.
+            self.pipeline.set_state(Gst.State.READY)
+            self.channel = self.webrtc.emit("create-data-channel", "input", None)
+            self.channel.connect("on-message-string",
+                                 lambda _c, text: self.message(text))
+            # Moves (pointer, touch) unordered and never resent: a lost one
+            # is outdated by the next, and resending held the later ones
+            # back.  Clicks and keys stay on the reliable channel.
+            self.fast = self.webrtc.emit(
+                "create-data-channel", "fast",
+                Gst.Structure.new_from_string(
+                    "application/data-channel, ordered=(boolean)false, "
+                    "max-retransmits=(int)0"))
+            if self.fast is not None:
+                self.fast.connect("on-message-string",
+                                  lambda _c, text: self.message(text))
+        # DIRECT: the encoder's access units go to the page by WebSocket
+        # (/video, DirectViewer); the RTP video feeds the offer's parameters
+        # (negotiate), then its valve closes.  A data channel for them
+        # drained at about 4 kB/s in GStreamer (2026-11-20).
+        self.video_channel = bool(direct and self.producer and remote)
+        self.pipeline.set_state(Gst.State.PLAYING)
+        if self.producer:
+            self.producer.attach(self.pipeline.get_by_name("frames"))
+
+    def message(self, text):
+        """The viewer's input, a setting of the stream, or its PAUSE, PLAY
+        and STOP buttons."""
+        if '"t":"pause"' in text or '"t":"play"' in text:
+            GLib.idle_add(self.pause, '"t":"pause"' in text)
+        elif '"t":"stop"' in text:
+            log_line("stopped by the viewer")
+            GLib.timeout_add(300, lambda: os.kill(os.getpid(), signal.SIGTERM) and False)
+        elif '"t":"keyframe"' in text:
+            if self.producer:
+                self.producer.keyframe_soon()
+        elif '"bitrate"' in text:
+            try:
+                mbps = float(json.loads(text)["mbps"])
+            except (ValueError, KeyError, TypeError):
+                return
+            GLib.idle_add(self.bitrate, min(20.0, max(0.5, mbps)))
+        else:
+            remote.handle(text)
+
+    def pause(self, on):
+        """Picture and sound held back (PAUSE), the encoder idle so that the
+        phone cools; or back (PLAY), from a new keyframe."""
+        for name in ("vv", "av"):
+            valve = self.pipeline.get_by_name(name)
+            if valve is not None and not (name == "vv" and self.video_channel):
+                valve.set_property("drop", on)
+        if self.producer:
+            self.producer.paused = on
+            if not on:
+                self.producer.keyframe()
+        else:
+            encoder = self.pipeline.get_by_name("enc")
+            if encoder is not None and not on:
+                encoder.get_static_pad("src").send_event(
+                    GstVideo.video_event_new_upstream_force_key_unit(
+                        Gst.CLOCK_TIME_NONE, True, 0))
+        log_line("paused by the viewer" if on else "playing again")
+        return GLib.SOURCE_REMOVE
+
+    def bitrate(self, mbps):
+        """A new bit rate from the page: the session starts again with it.
+        Not set on the running encoder: the Venus firmware died of it
+        (Err_Fatal in vbuffer.c, as the page sent its rate on connecting),
+        and its failed recovery powered the phone off (2026-11-18).  A
+        second later, so that a slider's moves make one restart."""
+        Handler.mbps = mbps
+        if rate_restart[0]:
+            GLib.source_remove(rate_restart[0])
+        rate_restart[0] = GLib.timeout_add(1000, self.rate_changed)
+        return GLib.SOURCE_REMOVE
+
+    def rate_changed(self):
+        rate_restart[0] = None
+        if Handler.mbps != (self.producer.mbps if self.producer else self.mbps):
+            log_line(f"bit rate {Handler.mbps} Mbit/s")
+            restart_session()
+        return GLib.SOURCE_REMOVE
+
+    def negotiate(self, _element, tries=60):
+        """The offer, with the producer once the payloader has seen the
+        stream's parameters (SPS and PPS, the offer's fmtp line), from the
+        first keyframe.  Offered before, the offer had no fmtp line for H.264, and
+        browsers decoded nothing, then fell back to VP8 (2026-11-19)."""
+        if self.producer and tries:
+            caps = self.webrtc.get_static_pad("sink_0").get_current_caps()
+            if caps is None or "sprop-parameter-sets" not in caps.to_string():
+                GLib.timeout_add(50, self.negotiate, _element, tries - 1)
+                return GLib.SOURCE_REMOVE
+        if self.video_channel:
+            self.pipeline.get_by_name("vv").set_property("drop", True)
+        promise = Gst.Promise.new_with_change_func(self.offered, None)
+        self.webrtc.emit("create-offer", None, promise)
+        return GLib.SOURCE_REMOVE
+
+    def offered(self, promise, _data):
+        # The reply owns the offer: it has to outlive this call's use of it.
+        reply = promise.get_reply()
+        offer = reply.get_value("offer")
+        self.webrtc.emit("set-local-description", offer, Gst.Promise.new())
+
+    def gathering(self, _element, _spec):
+        state = self.webrtc.get_property("ice-gathering-state")
+        if state == GstWebRTC.WebRTCICEGatheringState.COMPLETE:
+            local = self.webrtc.get_property("local-description")
+            self.offer = local.sdp.as_text()
+            self.offer_ready.set()
+
+    def connection(self, _element, _spec):
+        state = self.webrtc.get_property("ice-connection-state")
+        # The keyframes sent before the connection was up are lost.
+        if self.producer and state == GstWebRTC.WebRTCICEConnectionState.CONNECTED:
+            GLib.idle_add(lambda: self.producer.keyframe() or GLib.SOURCE_REMOVE)
+        if state in (
+            GstWebRTC.WebRTCICEConnectionState.FAILED,
+            GstWebRTC.WebRTCICEConnectionState.CLOSED,
+        ):
+            GLib.idle_add(end_session, self)
+
+    def answer(self, text):
+        _result, sdp = GstSdp.SDPMessage.new_from_text(text)
+        answer = GstWebRTC.WebRTCSessionDescription.new(
+            GstWebRTC.WebRTCSDPType.ANSWER, sdp
+        )
+        self.webrtc.emit("set-remote-description", answer, Gst.Promise.new())
+
+    def ask_loss(self):
+        self.webrtc.emit("get-stats", None,
+                         Gst.Promise.new_with_change_func(self.got_loss, None))
+        return GLib.SOURCE_CONTINUE
+
+    def got_loss(self, promise, _data):
+        """The video's fraction lost from the viewer's last receiver report."""
+        reply = promise.get_reply()
+        if reply is None:
+            return
+        found = []
+
+        def each(_field, value):
+            if (isinstance(value, Gst.Structure)
+                    and value.get_name() == "remote-inbound-rtp"
+                    and value.get_string("kind") == "video"):
+                ok, fraction = value.get_double("fraction-lost")
+                if ok:
+                    found.append(fraction)
+            return True
+        reply.foreach(each)
+        if found:
+            GLib.idle_add(lambda: self.producer.loss(max(found)) or GLib.SOURCE_REMOVE)
+
+    def stop(self, background=False):
+        """The pipeline down.  BACKGROUND, for a producer's viewer: in a
+        thread, since stopping a webrtcbin whose viewer has gone held the
+        main loop for 12 s, and the next viewer's start with it
+        (2026-11-19)."""
+        if self.keyframes:
+            GLib.source_remove(self.keyframes)
+            self.keyframes = None
+        if self.losses:
+            GLib.source_remove(self.losses)
+            self.losses = None
+        if self.producer:
+            self.producer.paused = False
+            self.producer.detach(self.pipeline.get_by_name("frames"))
+            if background:
+                threading.Thread(target=self.pipeline.set_state,
+                                 args=(Gst.State.NULL,), daemon=True).start()
+                return
+        self.pipeline.set_state(Gst.State.NULL)
+        last_stop[0] = time.monotonic()
+        if not self.proc:
+            return
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+        self.proc.stdout.close()
+
+
+session = None
+session_lock = threading.Lock()
+
+
+def cpu_temperature():
+    """The hottest CPU sensor, in degrees, or None."""
+    hottest = None
+    for zone in os.listdir("/sys/class/thermal"):
+        base = os.path.join("/sys/class/thermal", zone)
+        try:
+            with open(os.path.join(base, "type")) as f:
+                if not f.read().startswith("cpu"):
+                    continue
+            with open(os.path.join(base, "temp")) as f:
+                t = int(f.read()) / 1000
+        except (OSError, ValueError):
+            continue
+        hottest = t if hottest is None else max(hottest, t)
+    return None if hottest is None else round(hottest, 1)
+
+
+def capture_long():
+    if not Handler.size:
+        return None
+    width, height = map(int, Handler.size.split("@")[0].split("x"))
+    return max(width, height)
+
+
+def set_size(long, restart=True):
+    """A new picture size from the page: the long side LONG, the short one
+    in the same proportion, in the raw frames and the capture's scale
+    filter (which runs before wf-recorder turns the picture, so its two
+    sides are kept in their order); the menu's size setting with them; the
+    viewer connects again."""
+    dims, fps = Handler.size.split("@")
+    width, height = map(int, dims.split("x"))
+    scale = long / max(width, height)
+    width = int(width * scale + 0.5) // 2 * 2
+    height = int(height * scale + 0.5) // 2 * 2
+    Handler.size = f"{width}x{height}@{fps}"
+    command = Handler.capture["h264"]
+    for i, arg in enumerate(command[:-1]):
+        if arg == "-F" and command[i + 1].startswith("scale="):
+            a, b = map(int, command[i + 1][6:].split(":")[:2])
+            command[i + 1] = (f"scale={min(width, height)}:{max(width, height)}"
+                              if a < b else f"scale={width}:{height}")
+    state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    try:
+        with open(os.path.join(state, "wl-cast-size"), "w") as f:
+            f.write(f"{long}\n")
+    except OSError:
+        pass
+    log_line(f"picture size {width}x{height}")
+    if restart:
+        restart_session()
+
+
+def switch_screen(mode):
+    """The stream's screen mode changed from the page (main loop)."""
+    global screen
+    state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    try:
+        with open(os.path.join(state, "wl-cast-screen"), "w") as f:
+            f.write(mode + "\n")
+    except OSError:
+        pass
+    i = own_args.index("--screen")
+    own_args[i + 1] = mode
+    # A new screen at once (a viewer is here), none for the panel.
+    if mode == "phone":
+        os.environ.pop("WL_CAST_SCREEN_NOW", None)
+    else:
+        os.environ["WL_CAST_SCREEN_NOW"] = "1"
+    os.environ.pop("WL_CAST_OUTPUT", None)
+    if screen:
+        screen.stop()
+        screen = None
+    log_line(f"screen mode {mode}, from the page")
+    restart_session()
+    return GLib.SOURCE_REMOVE
+
+
+def restart_session():
+    """The viewer's session ends, its page told to connect again; with the
+    producer, the server starts again with the new settings."""
+    with session_lock:
+        current = session
+    if current:
+        channel = getattr(current, "channel", None)
+        if channel is not None:
+            GLib.idle_add(lambda: channel.emit("send-string", '{"t":"reconnect"}')
+                          and False)
+    if producer:
+        GLib.timeout_add(300, reexec)
+    elif current:
+        GLib.timeout_add(300, end_session, current)
+
+
+# The server's own arguments but --raw, for reexec; whether it turned the
+# screen's caffeine on (and reexec's predecessor, if it did).
+own_args = []
+caffeinated = [False]
+
+
+def reexec():
+    """The server again, in the same process, with the size, frame rate and
+    bit rate set now; the screen kept on if this one turned it on.  The
+    page waits for it and connects again."""
+    with session_lock:
+        current = session
+    if current:
+        current.stop()
+    producer.stop()
+    os.environ["WL_CAST_MBPS"] = str(Handler.mbps)
+    os.environ["WL_CAST_TARGET"] = str(Handler.target)
+    if caffeinated[0]:
+        os.environ["WL_CAST_CAFFEINE"] = "1"
+    if wifi_held[0]:
+        os.environ["WL_CAST_WIFI"] = "1"
+    if screen:
+        screen.stop(keep=True)
+        os.environ["WL_CAST_OUTPUT"] = screen.name
+    if approval:
+        os.environ["WL_CAST_ALLOWED"] = ",".join(
+            ip for ip, st in approval.state.items() if st == "allowed")
+    log_line(f"starting again: {Handler.size}, {Handler.mbps} Mbit/s")
+    argv = ([sys.argv[0], "--raw", Handler.size] + own_args
+            + Handler.capture["h264"] + ["--"] + Handler.capture["vp8"])
+    # Python itself: sys.executable names the Guix wrapper (exec -a), which
+    # would add the script once more.
+    os.execv("/proc/self/exe", ["python3"] + argv)
+
+
+def capture_fps():
+    return int(Handler.size.split("@")[1]) if Handler.size else None
+
+
+def set_fps(fps, chosen=True, restart=True):
+    """A new capture rate, from the page or the heat limit: the capture
+    commands, the raw frames' rate and the keyframe period change (and the
+    menu's setting, when chosen), and the viewer's session ends; its page,
+    told so, connects again."""
+    Handler.size = Handler.size.split("@")[0] + f"@{fps}"
+    for command in Handler.capture.values():
+        for i, arg in enumerate(command[:-1]):
+            if arg == "-r":
+                command[i + 1] = str(fps)
+            elif arg == "-p" and command[i + 1].startswith("g="):
+                command[i + 1] = f"g={fps}"
+    state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    if chosen:
+        try:
+            with open(os.path.join(state, "wl-cast-fps"), "w") as f:
+                f.write(f"{fps}\n")
+        except OSError:
+            pass
+    log_line(f"capture rate {fps} fps" + ("" if chosen else " (heat limit)"))
+    if restart:
+        restart_session()
+
+
+# The heat limit (the page's "heat", in the kept settings): every 15 s,
+# above it the capture rate drops 5 fps (down to 10), and 5 degrees under it
+# climbs back towards the rate chosen, a minute at least between steps.
+last_step = [0.0]
+
+
+def heat_check():
+    if not Handler.size or not Handler.target:
+        return GLib.SOURCE_CONTINUE
+    try:
+        with open(SETTINGS) as f:
+            limit = float(json.load(f).get("heat", 0))
+    except (OSError, ValueError, AttributeError):
+        limit = 0
+    temp, fps = cpu_temperature(), capture_fps()
+    if limit < 50 or temp is None or time.monotonic() - last_step[0] < 60:
+        return GLib.SOURCE_CONTINUE
+    # With the producer, in place: the encoder's rate, without starting the
+    # server again (each heat step cut the stream, 2026-11-19).
+    if producer:
+        cap = producer.heat_cap or Handler.target
+        if temp > limit and cap > 10:
+            producer.heat_cap = max(10, cap - 5)
+        elif temp < limit - 5 and cap < Handler.target:
+            producer.heat_cap = min(Handler.target, cap + 5)
+            if producer.heat_cap == Handler.target:
+                producer.heat_cap = None
+        else:
+            return GLib.SOURCE_CONTINUE
+        log_line(f"encoder rate {producer.rate()} fps (heat limit)")
+        last_step[0] = time.monotonic()
+        return GLib.SOURCE_CONTINUE
+    if temp > limit and fps > 10:
+        set_fps(max(10, fps - 5), chosen=False)
+        last_step[0] = time.monotonic()
+    elif temp < limit - 5 and fps < Handler.target:
+        set_fps(min(Handler.target, fps + 5), chosen=False)
+        last_step[0] = time.monotonic()
+    return GLib.SOURCE_CONTINUE
+
+
+# The screen stays on while the stream runs: the phone hung when it blanked
+# during a stream (author, 2026-11-18).  Caffeine (quick actions) is turned
+# on if it was off, and back off at the end.
+CAFFEINE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "pro1x-caffeine")
+
+
+def phone_locked():
+    """Whether the lock screen (gtklock) is up: Sway keeps it out of screen
+    captures, and the stream shows black (author, 2026-11-19)."""
+    for pid in os.listdir("/proc"):
+        if pid.isdigit():
+            try:
+                with open(f"/proc/{pid}/comm") as f:
+                    if f.read().strip() == "gtklock":
+                        return True
+            except OSError:
+                pass
+    return False
+
+
+def caffeine_on():
+    try:
+        with open(CAFFEINE) as f:
+            if f.read().strip() == "on":
+                return False
+    except OSError:
+        pass
+    subprocess.run(["sway-quick-actions", "--act", "caffeine"], timeout=10,
+                   stdin=subprocess.DEVNULL, capture_output=True)
+    return True
+
+
+def caffeine_off():
+    try:
+        with open(CAFFEINE) as f:
+            if f.read().strip() != "on":
+                return
+    except OSError:
+        return
+    subprocess.run(["sway-quick-actions", "--act", "caffeine"], timeout=10,
+                   stdin=subprocess.DEVNULL, capture_output=True)
+
+
+def end_session(old):
+    global session
+    with session_lock:
+        if session is old:
+            session = None
+    old.stop(background=True)
+    return GLib.SOURCE_REMOVE
+
+
+rate_restart = [None]
+# When the last session stopped: the next waits until 3 s after it.  Every
+# power-off with the portal capture came as one session's encoder closed and
+# the next opened at once (2026-11-18); with wf-recorder the next encoder
+# opens only after its first frame, a second later.
+last_stop = [0.0]
+
+
+def new_session(command, codec, size, created, direct=False):
+    """Runs in the main loop, where GStreamer's signals are handled."""
+    global session
+    # The old session ends before the new one starts: overlapping, two
+    # encoder sessions powered the phone off (2026-11-18, each time a viewer
+    # reconnected).  With wf-recorder, 3 s between them; the producer's
+    # viewers have no encoder of their own.
+    with session_lock:
+        old, session = session, None
+    if old:
+        old.stop(background=True)
+    wait = last_stop[0] + 3 - time.monotonic()
+    if wait > 0 and not producer:
+        time.sleep(wait)
+    with session_lock:
+        session = Session(command, codec, size, Handler.mbps, direct)
+        created["session"] = session
+    created["done"].set()
+    return GLib.SOURCE_REMOVE
+
+
+class DirectViewer:
+    """A DIRECT page's WebSocket: each encoded access unit as one binary
+    message, its header as the page reads it (frame number, index 0, count
+    1, keyframe flag, the time it left the encoder in ms, the encoder's
+    delay in ms).  While the network is behind (a frame waiting here, or
+    more than UNSENT bytes not yet sent by TCP), the producer gives the
+    encoder no new frame: nothing encoded is dropped, so no keyframe is
+    needed after a stall, and the delay stays bounded (Tesor, a WebSocket
+    stream for car browsers, also measures what its socket carries).
+    Dropping encoded frames turned each Wi-Fi stall into 2-3 s frozen
+    while a keyframe crossed the same link (2026-11-20).  Only a full
+    queue still skips to a keyframe.  One viewer at a time: a new one ends
+    the old."""
+
+    UNSENT = 48 * 1024          # about 0.2 s at 2 Mbit/s
+
+    current = None
+    GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.frames = queue.Queue(maxsize=12)
+        self.seq = 0
+        self.alive = True
+
+    def send(self, data, key, enc_ms=0):
+        if not self.alive:
+            return False
+        self.seq = (self.seq + 1) & 0xFFFFFFFF
+        head = struct.pack(">IHHBQH", self.seq, 0, 1, 1 if key else 0,
+                           int(time.time() * 1000), min(enc_ms, 65535))
+        try:
+            self.frames.put_nowait(head + data)
+            return True
+        except queue.Full:
+            return False
+
+    def behind(self):
+        """Whether the network has not caught up: a frame waiting, or TCP
+        holding more than UNSENT bytes (TIOCOUTQ: not sent or not yet
+        acknowledged)."""
+        if not self.frames.empty():
+            return True
+        try:
+            import fcntl
+            import termios
+            out = fcntl.ioctl(self.sock, termios.TIOCOUTQ, b"\0\0\0\0")
+            return struct.unpack("i", out)[0] > self.UNSENT
+        except OSError:
+            return False
+
+    def run(self):
+        """Writes the frames until the page goes (in its HTTP thread).
+        A small send buffer and no Nagle delay: with the system's own
+        buffer, megabytes of frames waited in TCP behind this queue, drawn
+        4 to 9 s late (2026-11-20); now the backlog shows here, where the
+        newest frame wins."""
+        import socket
+        try:
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256 * 1024)
+        except OSError:
+            pass
+        if DirectViewer.current:
+            DirectViewer.current.alive = False
+        DirectViewer.current = self
+        if producer:
+            producer.attach_direct(self.send)
+        log_line("direct: viewer connected")
+        try:
+            while self.alive:
+                try:
+                    msg = self.frames.get(timeout=1)
+                except queue.Empty:
+                    continue
+                n = len(msg)
+                if n < 126:
+                    frame = struct.pack(">BB", 0x82, n)
+                elif n < 65536:
+                    frame = struct.pack(">BBH", 0x82, 126, n)
+                else:
+                    frame = struct.pack(">BBQ", 0x82, 127, n)
+                self.sock.sendall(frame + msg)
+        except OSError:
+            pass
+        self.alive = False
+        if producer:
+            producer.detach_direct(self.send)
+        log_line("direct: viewer gone")
+
+
+# WL_CAST_TEST=NAME (the stream menu's TESTS): every connection, and
+# every one that fails (a TLS handshake refused...), in the log with its
+# address, to see how far a client (a car's browser) got.
+TEST = os.environ.get("WL_CAST_TEST", "")
+
+
+class DualServer(ThreadingHTTPServer):
+    """IPv6 and IPv4 on one socket (a phone's public IPv6 address on a
+    hotspot it does not run, for the car's browser: the TESTS); clients'
+    IPv4 addresses as such, not as ::ffff:a.b.c.d."""
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
+
+    def get_request(self):
+        sock, addr = super().get_request()
+        host = addr[0][7:] if addr[0].startswith("::ffff:") else addr[0]
+        if TEST:
+            log_line(f"test {TEST}: connection from {host}")
+        return sock, (host, addr[1])
+
+    def handle_error(self, request, client_address):
+        if TEST:
+            e = sys.exc_info()[1]
+            log_line(f"test {TEST}: {client_address[0]} failed: "
+                     f"{type(e).__name__}: {str(e)[:120]}")
+        else:
+            super().handle_error(request, client_address)
+
+
+def make_server(port):
+    try:
+        return DualServer(("::", port), Handler)
+    except OSError as e:
+        log_line(f"no IPv6 ({e}): IPv4 only")
+        return ThreadingHTTPServer(("0.0.0.0", port), Handler)
+
+
+class Handler(BaseHTTPRequestHandler):
+    screen_waiting = None           # client or multi-monitor, until a viewer
+    # Not "command": the HTTP request's method goes there.
+    capture = {}
+    size = ""
+    target = 0        # the capture rate chosen (the heat limit may hold it lower)
+    key = ""          # --key: every request carries it as ?k=
+    mbps = 6.0        # the encoder's bit rate, from the page
+
+    # --visibility hotspot: only the phone's hotspot (and the phone itself).
+    only_hotspot = False
+
+    def allowed(self):
+        if self.only_hotspot:
+            ip = self.client_address[0]
+            if not (ip.startswith("10.42.0.") or ip == "127.0.0.1"):
+                self.reply(b"forbidden: this stream is for the phone's hotspot only", code=403)
+                return False
+        if not self.key:
+            return True
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        given = query.get("k", [""])[0]
+        if hmac.compare_digest(given.encode(), self.key.encode()):
+            return True
+        self.reply(b"forbidden: the link's key is missing or wrong", code=403)
+        return False
+
+    def reply(self, body, kind="text/plain", code=200):
+        self.send_response(code)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if TEST and path not in ("/status", "/log", "/settings"):
+            log_line(f"test {TEST}: {self.client_address[0]} GET {path} "
+                     f"({self.headers.get('User-Agent', '?')[:80]})")
+        # The page itself asks for the key, so it comes without one.
+        if path == "/":
+            self.reply(INTERACTIVE_PAGE if remote else PAGE,
+                       "text/html; charset=utf-8")
+            return
+        if not self.allowed():
+            return
+        if path == "/video" and self.headers.get("Upgrade", "").lower() == "websocket":
+            accept = base64.b64encode(hashlib.sha1(
+                self.headers.get("Sec-WebSocket-Key", "").encode() + DirectViewer.GUID).digest())
+            # HTTP/1.1, written by hand: send_response says HTTP/1.0 (the
+            # server's protocol_version), which Chromium let pass and
+            # Firefox did not (its socket never opened, 2026-11-20).
+            self.wfile.write(b"HTTP/1.1 101 Switching Protocols\r\n"
+                             b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                             b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n")
+            self.wfile.flush()
+            self.close_connection = True
+            DirectViewer(self.connection).run()
+            return
+        if path == "/check":
+            self.reply(b"ok")
+        elif path == "/status":
+            self.reply(json.dumps({"cpu": cpu_temperature(),
+                                   "fps": capture_fps(),
+                                   "target": Handler.target,
+                                   "mbps": producer.mbps if producer else Handler.mbps,
+                                   "wifi_powersave": wifi_powersave(),
+                                   "live": producer.rate() if producer else None,
+                                   "screen": screen.mode if screen else "phone",
+                                   "screen_mode": (screen.mode if screen else
+                                                   Handler.screen_waiting or "phone"),
+                                   "size": Handler.size.split("@")[0] if Handler.size else None,
+                                   "long": capture_long(),
+                                   "locked": phone_locked(),
+                                   "waiting": Handler.screen_waiting}).encode(),
+                       "application/json")
+        elif path == "/settings":
+            try:
+                with open(SETTINGS, "rb") as f:
+                    self.reply(f.read(), "application/json")
+            except OSError:
+                self.reply(b"{}", "application/json")
+        elif self.path.startswith("/offer"):
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            codec = "h264" if query.get("codec") == ["h264"] else "vp8"
+            # The page's rate, unless the producer's encoder has its own: a
+            # different rate for each page restarted the server for each,
+            # and two pages open kept it restarting (2026-11-19).  Its rate
+            # changes by APPLY.
+            if not producer:
+                try:
+                    Handler.mbps = min(20.0, max(0.5, float(query["mbps"][0])))
+                except (KeyError, ValueError, IndexError):
+                    pass
+            if approval:
+                st = approval.check(self.client_address[0])
+                if st != "allowed":
+                    self.reply(st.encode(), code=202 if st == "waiting" else 403)
+                    return
+            if Handler.screen_waiting and not screen and producer:
+                # The first viewer: the server again with its screen, at the
+                # page's window's shape when it sends it (w, h), so that no
+                # second restart follows to fit it (each restart reloads the
+                # page); the page retries on 503 until it is up.
+                Handler.screen_waiting = None
+                try:
+                    width, height = int(query["w"][0]), int(query["h"][0])
+                    if 320 <= width <= 3840 and 320 <= height <= 3840:
+                        with open(Screen.SIZE, "w") as f:
+                            f.write(f"{width - width % 16}x{height - height % 16}\n")
+                except (KeyError, ValueError, IndexError, OSError):
+                    pass
+                os.environ["WL_CAST_SCREEN_NOW"] = "1"
+                self.reply(b"making its screen", code=503)
+                GLib.idle_add(lambda: reexec() and False)
+                return
+            created = {"done": threading.Event()}
+            GLib.idle_add(new_session, self.capture[codec], codec, self.size, created,
+                          query.get("direct") == ["1"])
+            if (
+                created["done"].wait(10)
+                and created["session"].offer_ready.wait(15)
+            ):
+                self.reply(created["session"].offer.encode())
+            else:
+                self.reply(b"no offer", code=500)
+        else:
+            self.reply(b"not found", code=404)
+
+    def do_POST(self):
+        if not self.allowed():
+            return
+        path = self.path.split("?")[0]
+        if path == "/screen":
+            # The page's screen mode button: kept as the menu's setting, the
+            # old screen taken down, the server started again with the new.
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            mode = query.get("mode", [""])[0]
+            if mode not in ("phone", "client", "multi-monitor") or "--screen" not in own_args:
+                self.reply(b"bad mode", code=400)
+                return
+            self.reply(b"ok")
+            GLib.idle_add(switch_screen, mode)
+            return
+        if path == "/fps":
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            try:
+                fps = int(query.get("fps", [""])[0])
+            except ValueError:
+                fps = 0
+            if not 5 <= fps <= 60 or not self.size:
+                self.reply(b"bad rate", code=400)
+                return
+            Handler.target = fps
+            set_fps(fps)
+            self.reply(b"ok")
+            return
+        if path == "/size":
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            try:
+                long = int(query.get("long", [""])[0])
+            except ValueError:
+                long = 0
+            if long not in (960, 1280, 1600, 1920) or not self.size:
+                self.reply(b"bad size", code=400)
+                return
+            set_size(long)
+            self.reply(b"ok")
+            return
+        if path == "/apply":
+            # The page's rate, fps and size together: one restart.
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+
+            def number(name, kind):
+                try:
+                    return kind(query[name][0])
+                except (KeyError, ValueError, IndexError):
+                    return None
+            mbps, fps, long = number("mbps", float), number("fps", int), number("long", int)
+            width, height = number("w", int), number("h", int)
+            if width is not None or height is not None:
+                # The stream's own output at the viewer's window's shape.
+                if (not screen or width is None or height is None
+                        or not (160 <= width <= 1920 and 160 <= height <= 1920)):
+                    self.reply(b"bad size", code=400)
+                    return
+                # Multiples of 16 (H.264's blocks; see fitted in the page).
+                width, height = width // 16 * 16, height // 16 * 16
+                Handler.size = f"{width}x{height}@" + Handler.size.split("@")[1]
+                try:
+                    with open(Screen.SIZE, "w") as f:
+                        f.write(f"{width}x{height}\n")
+                except OSError:
+                    pass
+                log_line(f"screen size {width}x{height}")
+                long = None
+            if ((fps is not None and not 5 <= fps <= 60)
+                    or (long is not None and long not in (960, 1280, 1600, 1920))
+                    or ((fps or long) and not self.size)):
+                self.reply(b"bad setting", code=400)
+                return
+            if mbps is not None:
+                Handler.mbps = min(20.0, max(0.5, mbps))
+                log_line(f"bit rate {Handler.mbps} Mbit/s")
+            if long is not None:
+                set_size(long, restart=False)
+            if fps is not None:
+                Handler.target = fps
+                set_fps(fps, restart=False)
+            GLib.idle_add(lambda: restart_session() or GLib.SOURCE_REMOVE)
+            self.reply(b"ok")
+            return
+        if path == "/settings":
+            text = self.rfile.read(min(int(self.headers["Content-Length"]), 2048))
+            try:
+                kept = json.loads(text)
+                # Numbers, switches and short words (the input mode): with
+                # numbers only, every save since the input mode was refused,
+                # and a new browser got the defaults (author, 2026-11-19).
+                assert isinstance(kept, dict) and all(
+                    isinstance(v, (bool, int, float))
+                    or (isinstance(v, str) and len(v) <= 16)
+                    for v in kept.values())
+            except (ValueError, AssertionError):
+                self.reply(b"bad settings", code=400)
+                return
+            os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
+            with open(SETTINGS + ".new", "w") as f:
+                json.dump(kept, f)
+            os.replace(SETTINGS + ".new", SETTINGS)
+            if producer:
+                producer.steady = bool(kept.get("steady", True))
+                producer.adaptive = bool(kept.get("adaptive", True))
+                if not producer.adaptive:
+                    producer.limit = producer.fps
+            wifi_hold(bool(kept.get("wifi_awake", True)))
+            self.reply(b"ok")
+            return
+        if path == "/log":
+            text = self.rfile.read(min(int(self.headers["Content-Length"]), 4096))
+            log_line(self.client_address[0] + " " + text.decode(errors="replace"))
+            self.reply(b"ok")
+            return
+        if path != "/answer":
+            self.reply(b"not found", code=404)
+            return
+        text = self.rfile.read(int(self.headers["Content-Length"])).decode()
+        with session_lock:
+            current = session
+        if current:
+            GLib.idle_add(lambda: current.answer(text) or GLib.SOURCE_REMOVE)
+            self.reply(b"ok")
+        else:
+            self.reply(b"no session", code=409)
+
+    def log_message(self, *_args):
+        pass
+
+
+def main_loop():
+    """A loop that SIGTERM and SIGINT end."""
+    loop = GLib.MainLoop()
+
+    def quit_loop(*_args):
+        # Stopping a pipeline with a viewer half connected can hang (seen
+        # 2026-11-18, the interactive offer unanswered): out within 8 s.
+        threading.Timer(8, lambda: os._exit(0)).start()
+        loop.quit()
+
+    signal.signal(signal.SIGTERM, quit_loop)
+    signal.signal(signal.SIGINT, quit_loop)
+    GLib.timeout_add(500, lambda: GLib.SOURCE_CONTINUE)  # lets Python see signals
+    return loop
+
+
+def send_udp(host, port, size, command):
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE)
+    pipeline = Gst.parse_launch(
+        f"{raw_source(proc.stdout.fileno(), size)} ! {hardware(size, gop=3)} ! "
+        f"mpegtsmux alignment=7 ! udpsink host={host} port={port} sync=false"
+    )
+    loop = main_loop()
+    bus = pipeline.get_bus()
+    bus.add_signal_watch()
+    bus.connect("message::error", lambda *_args: loop.quit())
+    keep_keyframes(pipeline, every=3)
+    pipeline.set_state(Gst.State.PLAYING)
+    try:
+        loop.run()
+    finally:
+        pipeline.set_state(Gst.State.NULL)
+        proc.terminate()
+
+
+def main():
+    Gst.init(None)
+    if sys.argv[1:2] == ["udp"] and len(sys.argv) > 5:
+        send_udp(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:])
+        return
+    global remote, portal, producer
+    args = sys.argv[1:]
+    if args[:1] == ["--raw"]:
+        Handler.size, args = args[1], args[2:]
+    if args[:1] == ["--key"]:
+        Handler.key, args = args[1], args[2:]
+        own_args.extend(["--key", Handler.key])
+    tls = None
+    if args[:1] == ["--tls"]:
+        own_args.extend(args[:2])
+        tls, args = int(args[1]), args[2:]
+    global approval, screen
+    if args[:1] == ["--screen"]:
+        own_args.extend(args[:2])
+        # The screen of its own only once a viewer connects (author,
+        # 2026-11-20: made at start, it resized the phone's windows for
+        # nobody): until then the panel; the first viewer's offer starts
+        # the server again with it (WL_CAST_SCREEN_NOW, kept over
+        # later restarts).
+        if (args[1] in ("client", "multi-monitor") and Handler.size
+                and os.environ.get("WL_CAST_SCREEN_NOW") != "1"):
+            Handler.screen_waiting = args[1]
+            log_line(f"{args[1]} screen once a viewer connects")
+        elif args[1] in ("client", "multi-monitor") and Handler.size:
+            Handler.size = Screen.kept(Handler.size)
+            try:
+                screen = Screen(args[1], Handler.size)
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
+                log_line(f"no screen of its own ({e}): the panel")
+        args = args[2:]
+    if args[:1] == ["--approve"]:
+        own_args.extend(args[:2])
+        if args[1] in ("tap", "fingerprint"):
+            approval = Approval(args[1])
+            log_line(f"viewers approved on the phone ({args[1]})")
+        args = args[2:]
+    if args[:1] == ["--visibility"]:
+        own_args.extend(args[:2])
+        Handler.only_hotspot = args[1] == "hotspot"
+        args = args[2:]
+    if args[:1] == ["--portal"] and SCREENCAST:
+        # The helper captures by itself: no portal session.
+        own_args.extend(args[:2])
+        portal = "screencast"
+        args = args[2:]
+    if args[:1] == ["--portal"]:
+        own_args.extend(args[:2])
+        try:
+            # The stream's own output is not turned.
+            portal = Portal("normal" if screen else args[1])
+            log_line("capture by the ScreenCast portal")
+        except (GLib.Error, RuntimeError, KeyError, IndexError, OSError) as e:
+            log_line(f"no ScreenCast portal ({e}): wf-recorder")
+        args = args[2:]
+    if screen and not portal:
+        # wf-recorder records the panel: no screen of its own without the
+        # portal.
+        log_line("no screen of its own without the ScreenCast portal")
+        screen.stop()
+        screen = None
+    # Set by reexec, else the rate the page kept on the phone.
+    try:
+        Handler.mbps = float(os.environ.pop("WL_CAST_MBPS"))
+    except (KeyError, ValueError):
+        try:
+            Handler.mbps = min(20.0, max(0.5, float(kept_setting("rate", Handler.mbps))))
+        except (ValueError, TypeError):
+            pass
+    if Handler.size:
+        Handler.target = int(os.environ.pop("WL_CAST_TARGET", "0")) or \
+            int(Handler.size.split("@")[1])
+    if portal == "screencast" and Handler.size:
+        try:
+            producer = Screencast(screen.name if screen else PANEL,
+                                  Handler.size, Handler.mbps)
+        except OSError as e:
+            log_line(f"wl-cast-capture failed to start ({e})")
+    elif portal and Handler.size:
+        try:
+            producer = Producer(portal, Handler.size, Handler.mbps)
+        except (GLib.Error, RuntimeError, KeyError, IndexError) as e:
+            log_line(f"no ScreenCast portal ({e}): wf-recorder")
+    caffeinated[0] = os.environ.pop("WL_CAST_CAFFEINE", "") == "1"
+    # Held by the server before a reexec, and still held.
+    wifi_held[0] = os.environ.pop("WL_CAST_WIFI", "") == "1"
+    wifi_hold(bool(kept_setting("wifi_awake", True)))
+    if args[:1] == ["--interactive"]:
+        own_args.append("--interactive")
+        args = args[1:]
+        remote = Remote(screen.name if screen else PANEL)
+        global panel_touch
+        if screen and screen.mode == "client":
+            try:
+                panel_touch = PanelTouch(remote, Handler.size)
+            except (OSError, RuntimeError, ImportError) as err:
+                log_line(f"the panel's touches stay on the panel: {err}")
+        log_line("started")
+        try:
+            caffeinated[0] = caffeine_on() or caffeinated[0]
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        GLib.timeout_add_seconds(15, heat_check)
+    if "--" not in args[1:]:
+        sys.exit(__doc__.splitlines()[0])
+    own_args.append(args[0])
+    split = args.index("--", 1)
+    Handler.capture = {"h264": args[1:split], "vp8": args[split + 1:]}
+    server = make_server(int(args[0]))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    if tls:
+        try:
+            serve_tls(tls)
+        except (OSError, subprocess.SubprocessError, ValueError) as e:
+            log_line(f"no HTTPS: {e}")
+    if producer:
+        threading.Thread(target=watch_output, args=(screen.name if screen else PANEL,),
+                         daemon=True).start()
+    loop = main_loop()
+    try:
+        loop.run()
+    finally:
+        # What the phone shows and its Wi-Fi first, quick and what matters:
+        # behind the pipelines, the end's time limit cut them off, and the
+        # stream's screen, its mirror workspace and power saving stayed
+        # (author, 2026-11-19).
+        if panel_touch:
+            panel_touch.stop()
+        if screen:
+            screen.stop()
+        wifi_hold(False)
+        if caffeinated[0]:
+            try:
+                caffeine_off()
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        with session_lock:
+            current = session
+        if current:
+            current.stop()
+        if producer:
+            producer.stop()
+
+
+if __name__ == "__main__":
+    main()
