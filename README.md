@@ -63,7 +63,7 @@ Needs wayland, wayland-protocols, wlr-protocols, mesa (gbm, EGL, GLES 2) and lib
 
 ## AI assistance
 
-AI assistance was significant in writing this project. I decided what to build and tested the results on my phone and in my car. Expect rough edges; reports are welcome.
+This project used AI assistance. I am not particularly proud of it, but none of this would have been possible if I were coding it alone. Everything was however directed and tested by a human, with some organic code writing and review as well. Expect rough edges still: this was written and tested on a mobile Linux device only. PRs are welcome.
 
 ## License
 
