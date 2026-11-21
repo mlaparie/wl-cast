@@ -83,12 +83,14 @@ start() {
     addr=${addr:-$(address)}
     [ -n "$addr" ] || { echo "wl-cast: no network" >&2; exit 1; }
 
-    # The output's size in pixels, 1920 at most on its long side, even.
+    # The output's size in pixels, even, its long side at most 1920 or the
+    # size last chosen on the page.
+    long=$(cat "${XDG_STATE_HOME:-$HOME/.local/state}/wl-cast-size" 2>/dev/null)
     read -r turn w h < <(swaymsg -t get_outputs -r | jq -r --arg o "$WL_CAST_PANEL" '
         [.[] | select(.name == $o)][0]
         | "\(.transform) \(.rect.width * .scale) \(.rect.height * .scale)"')
-    read -r w h < <(awk -v w="$w" -v h="$h" 'BEGIN {
-        m = w > h ? w : h; f = m > 1920 ? 1920 / m : 1
+    read -r w h < <(awk -v w="$w" -v h="$h" -v l="${long:-1920}" 'BEGIN {
+        m = w > h ? w : h; f = m > l ? l / m : 1
         w = int(w * f + 0.5); h = int(h * f + 0.5); print w - w % 2, h - h % 2 }')
     # wf-recorder scales before it turns the picture.
     case "$turn" in *90|*270) filter="scale=$h:$w" ;; *) filter="scale=$w:$h" ;; esac
