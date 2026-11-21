@@ -22,15 +22,19 @@ Everything specific to your host goes in an optional `~/.config/wl-cast/hook` sc
 
 ## Performance
 
-Measured on the Pro¹x (Snapdragon 662, Venus encoder):
+Measured on the Pro¹x (Snapdragon 662, Venus encoder), streaming at 960x480 to Chromium on a PC on the same Wi-Fi:
 
 | | |
 |---|---|
-| screen to encoded frame | 32-45 ms |
-| screen to browser, same Wi-Fi | about 70 ms |
-| CPU for capture and encoding | about 4 % of a core |
-| GPU for the conversion to NV12 | about 2.5 % of its time (1600x800, 20 fps); Sway's copy adds nothing measurable |
+| screen to encoded frame | about 20 ms, 30 ms at worst |
+| frames | 30 per second while the picture moves, none lost |
+| screen to browser | about 60-70 ms on a good Wi-Fi link (6-10 ms round trip, 30 ms of browser buffer); a bad link adds hundreds of ms |
+| CPU | about 40 % of one core (server 27 %, capture 8 %, sound 8 %), plus 3 % in Sway |
+| GPU | about 19 % of its time for the conversion to NV12, plus 1 % in Sway |
+| heat | about 6 °C more after a few minutes |
 | for comparison, the usual capture path (xdg-desktop-portal-wlr, PipeWire, GStreamer) | frames 400 ms old, more than a core |
+
+Use 5 GHz Wi-Fi if you can: on the 2.4 GHz band of the same router, the phone took 500 ms to reach it, against 8 ms on 5 GHz.
 
 ## Install
 
