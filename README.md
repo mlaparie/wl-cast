@@ -4,7 +4,7 @@ Use your Wayland screen from a browser on another device, interactively. Nothing
 
 ![demo](demo/demo.png)
 
-I wrote it for my Linux phone (an F(x)tec Pro¹x running Guix and Sway), so I can enjoy all my usual Linux utilities and programs (music player, music streaming, and everything else). It needs Sway for now (the capture alone works on any wlroots compositor) and a V4L2 hardware H.264 encoder.
+I wrote it for my Linux phone (an F(x)tec Pro¹x running Guix and Sway), so I can enjoy all my usual Linux utilities and programs (music player, music streaming, and everything else) in my car or on any other machine with a browser. It needs Sway for now (the capture alone works on any wlroots compositor) and a V4L2 hardware H.264 encoder.
 
 ## How it works
 
