@@ -6,6 +6,8 @@
 #   wl-cast status              the links, if it runs
 #
 # Options:
+#   -o OUTPUT    the screen to stream (default: asked when there are
+#                several, in the terminal or by a click with slurp)
 #   -a ADDRESS   the address put in the links (default: the first one other
 #                devices can reach)
 #   -p PORT      HTTP port (8081); -t PORT: HTTPS port (8443)
@@ -17,9 +19,10 @@
 #   -A APPROVE   off, tap (a notification) or fingerprint, for a new viewer
 #   -v WHO       hotspot, lan (default) or wan: who may connect
 #
-# wl-cast-server does the work; this only picks its arguments.  The screen
-# is WL_CAST_PANEL, else the first active output.  wf-recorder is the
-# fallback when wl-cast-capture cannot run.
+# wl-cast-server does the work; this only picks its arguments.
+# wf-recorder is the fallback when wl-cast-capture cannot run.  The
+# page's own buttons and the host's hook are in ~/.config/wl-cast
+# (README).
 set -u
 
 rt=${XDG_RUNTIME_DIR:-/tmp}
@@ -33,6 +36,23 @@ running() { [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; }
 stop() {
     running && kill -TERM -- "-$(cat "$pid_file")" 2>/dev/null
     rm -f "$pid_file" "$links_file"
+}
+
+# The output to stream: -o, WL_CAST_PANEL, the only one, or the one picked.
+pick_output() {
+    [ -n "${WL_CAST_PANEL:-}" ] && { echo "$WL_CAST_PANEL"; return; }
+    outs=$(swaymsg -t get_outputs -r | jq -r '.[] | select(.active) | .name')
+    if [ "$(printf '%s\n' "$outs" | grep -c .)" -le 1 ]; then
+        echo "$outs"
+    elif [ -t 0 ] && command -v fzf >/dev/null; then
+        printf '%s\n' "$outs" | fzf --prompt='screen to stream > ' --height=~10
+    elif [ -t 0 ]; then
+        select o in $outs; do [ -n "$o" ] && { echo "$o"; break; }; done
+    elif command -v slurp >/dev/null; then
+        slurp -o -f %o
+    else
+        printf '%s\n' "$outs" | head -1
+    fi
 }
 
 # Not USB, loopback, containers or bridges: only the host reaches those.
@@ -49,20 +69,23 @@ start() {
         key=$(LC_ALL=C tr -dc 'a-km-z2-9' < /dev/urandom 2>/dev/null | head -c 5)
         echo "$key" > "$key_file"
     fi
-    while getopts a:p:t:k:r:s:A:v: o; do
+    while getopts o:a:p:t:k:r:s:A:v: o; do
         case $o in
-            a) addr=$OPTARG ;; p) port=$OPTARG ;; t) tls=$OPTARG ;;
+            o) WL_CAST_PANEL=$OPTARG ;; a) addr=$OPTARG ;; p) port=$OPTARG ;; t) tls=$OPTARG ;;
             k) key=$OPTARG ;; r) fps=$OPTARG ;; s) screen=$OPTARG ;;
             A) approve=$OPTARG ;; v) who=$OPTARG ;;
             *) exit 2 ;;
         esac
     done
+    WL_CAST_PANEL=$(pick_output)
+    [ -n "$WL_CAST_PANEL" ] || { echo "wl-cast: no screen chosen" >&2; exit 1; }
+    export WL_CAST_PANEL
     addr=${addr:-$(address)}
     [ -n "$addr" ] || { echo "wl-cast: no network" >&2; exit 1; }
 
     # The output's size in pixels, 1920 at most on its long side, even.
-    read -r turn w h < <(swaymsg -t get_outputs -r | jq -r --arg o "${WL_CAST_PANEL:-}" '
-        [.[] | select(.active and ($o == "" or .name == $o))][0]
+    read -r turn w h < <(swaymsg -t get_outputs -r | jq -r --arg o "$WL_CAST_PANEL" '
+        [.[] | select(.name == $o)][0]
         | "\(.transform) \(.rect.width * .scale) \(.rect.height * .scale)"')
     read -r w h < <(awk -v w="$w" -v h="$h" 'BEGIN {
         m = w > h ? w : h; f = m > 1920 ? 1920 / m : 1

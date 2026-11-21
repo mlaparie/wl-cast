@@ -1,0 +1,12 @@
+# ~/.config/wl-cast/buttons: the stream page's own buttons, in order.
+# One per line: a label, then the command it runs on the host.  The command
+# runs through Sway, on the stream's screen, with WL_CAST_OUTPUT (that
+# screen) and WL_CAST_PANEL (the one streamed) set.  Changes show at the
+# page's next reload.  Three fingers on the page fold or show the buttons.
+#
+# The commands below are placeholders: put your own launcher, window
+# switcher, menu or on-screen keyboard there.
+WIN   notify-send wl-cast "WIN: your window switcher here"
+QA    notify-send wl-cast "QA: your quick settings here"
+APPS  notify-send wl-cast "APPS: your app launcher here"
+OSK   notify-send wl-cast "OSK: your on-screen keyboard here"

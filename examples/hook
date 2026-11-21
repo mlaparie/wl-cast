@@ -1,0 +1,31 @@
+#!/bin/sh
+# ~/.config/wl-cast/hook: what wl-cast-server cannot know about your host.
+# Optional; make it executable.  Called as `hook EVENT ARG...':
+#
+#   awake on|off     keep the screen from blanking while the stream runs.
+#                    Exit 0 on "on" only when you changed something, so
+#                    that "off" follows at the end.
+#   wifi hold|release  Wi-Fi power saving off while streaming, back after.
+#   touch DEVICE OUTPUT  the viewer's touches arrive on DEVICE (an evdev
+#                    node), mapped to OUTPUT.  Run your gesture tool on it
+#                    (lisgd -d DEVICE ...) and keep running: it is stopped
+#                    with the stream.
+#   screen-gone OUTPUT  the viewer's own screen was removed; move back what
+#                    you put there.
+#
+# Anything else: exit 1.
+
+case "$1" in
+    awake)
+        # e.g. an idle inhibitor of your own; nothing here.
+        exit 1 ;;
+    wifi)
+        # e.g. sudo -n iw dev wlan0 set power_save off
+        exit 1 ;;
+    touch)
+        # e.g. exec lisgd -d "$2" -g "1,DU,T,*,R,your-command"
+        exit 1 ;;
+    screen-gone)
+        exit 0 ;;
+esac
+exit 1
