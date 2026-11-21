@@ -6,6 +6,8 @@
 #   wl-cast status              the links, if it runs
 #   wl-cast dim [on|off]        with start -d: turn the screen black, or
 #                               light it again (no argument: the other)
+#   wl-cast pause | play        hold the picture and sound, and go on: for
+#                               a call, from your phone's call handling
 #
 # Options:
 #   -o OUTPUT    the screen to stream (default: asked when there are
@@ -175,6 +177,8 @@ case "${1:-}" in
     stop) stop ;;
     status) running && cat "$links_file" ;;
     dim) dim "${2:-}" ;;
+    pause) running && kill -USR1 "$(cat "$pid_file")" ;;
+    play) running && kill -USR2 "$(cat "$pid_file")" ;;
     -h|--help|help) usage ;;
     *) usage >&2; exit 2 ;;
 esac
