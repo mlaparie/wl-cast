@@ -259,7 +259,7 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
 #ic{font:11px monospace;background:#333;color:#eee;border:1px solid #555;padding:0 8px}
 #info.collapsed #ib{display:none}
 #iv{display:none}#info.collapsed #iv{display:inline}#iv span{margin-right:6px}
-#clock{font-size:9px;color:#aaa}#info.collapsed #clock{display:none}
+#clock{color:#fff}#info.collapsed #clock{display:none}
 #info.collapsed{padding:2px 4px}
 #gl{margin-top:6px}#gl span{margin-right:10px}
 #lockmsg,#callmsg{position:fixed;left:50%;top:40%;transform:translate(-50%,-50%);display:none;
@@ -281,7 +281,7 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
 #set button{font:16px monospace;background:#222;color:#eee;border:1px solid #555;
   border-radius:0;padding:8px 12px;margin-top:8px}
 #k{position:fixed;left:0;bottom:0;width:1px;height:1px;opacity:0;border:0}
-#clock{font:bold 16px monospace;color:#ff0;margin-bottom:4px}
+#clock{margin-bottom:2px}
 #gate{position:fixed;left:50%;top:40%;transform:translate(-50%,-50%);display:none;
   z-index:3;background:#222;color:#eee;font:20px monospace;padding:16px;
   text-align:center}
