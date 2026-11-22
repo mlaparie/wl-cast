@@ -988,11 +988,13 @@ function graphPush(s) {
     graph[name].push(value === undefined ? null : value);
     if (graph[name].length > 120) graph[name].shift();
   }
-  // Folded, INFO shows only the curves' values now, in their colours.
+  // Folded, INFO shows only the curves' values, each its mean over the
+  // last 10 s, in their colours.
   const iv = document.getElementById("iv");
   iv.innerHTML = "";
   for (const [name, color] of GRAPH) {
-    const now = graph[name][graph[name].length - 1];
+    const last = graph[name].slice(-10).filter(x => x !== null);
+    const now = last.length ? Math.round(last.reduce((a, b) => a + b, 0) / last.length) : null;
     const tag = document.createElement("span");
     tag.style.color = color;
     tag.textContent = now === null ? "" : String(now);
