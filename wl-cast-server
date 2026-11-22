@@ -214,6 +214,7 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
 #bar button{font:12px monospace;background:#222;color:#eee;border:1px solid #555;
   border-radius:0;padding:4px 7px}
 #bar.folded .x{display:none}
+#bar button.held{background:#875;color:#fff}
 #info{position:fixed;left:6px;top:6px;font:14px monospace;color:#eee;
   background:rgba(0,0,0,.75);padding:8px;display:none;z-index:1}
 #info pre{margin:0;font:inherit}
@@ -245,7 +246,7 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
 </style>
 <video id="v" autoplay muted playsinline></video><canvas id="c"></canvas>
 <div id="bar"><!--BUTTONS-->
-<button class="x" id="bk">LKB</button><button class="x" id="bu">MUTED</button>
+<button class="x" id="bk">LKB</button><button class="x mod" data-m="meta">SUPER</button><button class="x mod" data-m="ctrl">CTRL</button><button class="x mod" data-m="alt">ALT</button><button class="x" id="bu">MUTED</button>
 <button class="x" id="bm">VIDEO</button><button class="x" id="bv">HOST</button><button class="x" id="bt">TOUCH</button>
 <button class="x" id="bp">FREE</button><button class="x" id="bs">SET</button>
 <button class="x" id="bi">INFO</button><button class="x" id="bz">PAUSE</button>
@@ -350,7 +351,22 @@ addEventListener("unhandledrejection", e =>
 // Moves (absolute pointer and touch) on the unordered, never-resent "fast"
 // channel: a lost one is outdated by the next.  The rest, reliable.
 let fast = null;
+// SUPER, CTRL and ALT on the bar: held for the next key or text typed,
+// for viewers whose keyboard lacks one or whose browser drops it (Android
+// keeps Meta to itself, 2026-11-22).  Tapped again: let go.
+const held = {meta: false, ctrl: false, alt: false};
+for (const b of document.querySelectorAll("#bar .mod")) {
+  b.addEventListener("mousedown", e => e.preventDefault());   // the LKB stays open
+  b.onclick = () => { held[b.dataset.m] = !held[b.dataset.m]; b.classList.toggle("held", held[b.dataset.m]); };
+}
+function withHeld(o) {
+  if (o.t !== "key" && o.t !== "text") return o;
+  for (const m in held) if (held[m]) { o[m] = true; held[m] = false; }
+  for (const b of document.querySelectorAll("#bar .mod")) b.classList.remove("held");
+  return o;
+}
 function send(o) {
+  o = withHeld(o);
   counts[o.t] = (counts[o.t] || 0) + 1;
   const c = (o.t === "move" || o.t === "tmove") && fast && fast.readyState === "open" ? fast : chan;
   if (c && c.readyState === "open") c.send(JSON.stringify(o));
@@ -2824,14 +2840,14 @@ class Remote:
             self.gestures.terminate()
             self.gestures = None
 
-    def text(self, text):
+    def text(self, text, ctrl=False, alt=False, meta=False):
         for ch in text:
             shift = ch.isupper() or ch in SHIFTED
             base = SHIFTED.get(ch, ch.lower())
             code = (f"Key{base.upper()}" if base.isalpha() and base.isascii()
                     else f"Digit{base}" if base.isdigit() else PLAIN.get(base))
             if code in CODES:
-                self.tap(getattr(self.e, CODES[code]), shift=shift)
+                self.tap(getattr(self.e, CODES[code]), shift, ctrl, alt, meta)
 
     def handle(self, message):
         try:
@@ -2901,7 +2917,8 @@ class Remote:
                 self.tap(getattr(e, CODES[m["code"]]), m.get("shift"),
                          m.get("ctrl"), m.get("alt"), m.get("meta"))
             elif kind == "text":
-                self.text(str(m.get("text", ""))[:200])
+                self.text(str(m.get("text", ""))[:200], m.get("ctrl"),
+                          m.get("alt"), m.get("meta"))
             p.syn()
 
 
