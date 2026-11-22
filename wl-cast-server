@@ -141,10 +141,10 @@ def buttons():
 # The page's built-in keyboard buttons: the viewer's keyboard (LKB), and
 # Super, Ctrl and Alt held for the next key.
 BUILTIN = {
-    "lkb": '<button class="x" id="bk">LKB</button>',
-    "super": '<button class="x mod" data-m="meta">SUPER</button>',
     "ctrl": '<button class="x mod" data-m="ctrl">CTRL</button>',
+    "super": '<button class="x mod" data-m="meta">SUPER</button>',
     "alt": '<button class="x mod" data-m="alt">ALT</button>',
+    "lkb": '<button class="x" id="bk">LKB</button>',
 }
 
 

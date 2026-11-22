@@ -4,14 +4,14 @@
 # screen) and WL_CAST_PANEL (the one streamed) set.  Changes show at the
 # page's next reload.  Three fingers on the page fold or show the buttons.
 #
-# They sit at the bottom left, after the built-in LKB, SUPER, CTRL and ALT.
+# They sit at the bottom left, after the built-in CTRL, SUPER, ALT and LKB.
 # A line [top-right] puts the buttons after it at the top right, beside the
 # page's own, and [bottom-left] back; =lkb, =super, =ctrl and =alt place
 # the built-in ones where they appear.
 #
 # The commands below are placeholders: put your own launcher, window
 # switcher, menu or on-screen keyboard there.
+OSK   notify-send wl-cast "OSK: your on-screen keyboard here"
 WIN   notify-send wl-cast "WIN: your window switcher here"
 QA    notify-send wl-cast "QA: your quick settings here"
 APPS  notify-send wl-cast "APPS: your app launcher here"
-OSK   notify-send wl-cast "OSK: your on-screen keyboard here"
