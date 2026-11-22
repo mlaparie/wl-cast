@@ -252,11 +252,11 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
   border-radius:0;padding:4px 7px}
 #bar.folded .x,#bar.folded ~ #kbar .x{display:none}
 #kbar button.held,#bar button.held{background:#875;color:#fff}
-#info{position:fixed;left:6px;top:6px;font:14px monospace;color:#eee;
+#info{position:fixed;left:6px;top:40px;font:11px monospace;color:#eee;
   background:rgba(0,0,0,.75);padding:8px;display:none;z-index:1}
 #info pre{margin:0;font:inherit}
 #ih{display:flex;justify-content:space-between;gap:12px;cursor:move;touch-action:none;user-select:none}
-#ic{font:14px monospace;background:#333;color:#eee;border:1px solid #555;padding:0 8px}
+#ic{font:11px monospace;background:#333;color:#eee;border:1px solid #555;padding:0 8px}
 #info.collapsed #ib{display:none}
 #gl{margin-top:6px}#gl span{margin-right:10px}
 #lockmsg,#callmsg{position:fixed;left:50%;top:40%;transform:translate(-50%,-50%);display:none;
@@ -287,9 +287,9 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
 </style>
 <video id="v" autoplay muted playsinline></video><canvas id="c"></canvas>
 <div id="bar"><!--BUTTONS-->
-<button class="x" id="bv">HOST</button><button class="x" id="bu">MUTED</button>
+<button class="x" id="bi">INFO</button><button class="x" id="bv">HOST</button><button class="x" id="bu">MUTED</button>
 <button class="x" id="bm">VIDEO</button><button class="x" id="bt">TOUCH</button><button class="x" id="bd">DIM</button>
-<button class="x" id="bp">FREE</button><button class="x" id="bi">INFO</button><button class="x" id="bs">SET</button>
+<button class="x" id="bp">FREE</button><button class="x" id="bs">SET</button>
 <button class="x" id="bz">PAUSE</button><button class="x" id="bx">STOP</button><button class="x" id="br">RELOAD</button>
 <button id="bc"></button></div><div id="kbar"><!--KBUTTONS--></div>
 <div id="set">
@@ -308,7 +308,7 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
 <button id="sy">RESYNC</button></div>
 <div id="note"></div><div id="callmsg">The phone is busy (a call): the stream is paused until it ends.</div><div id="lockmsg">The phone is locked: the picture stays still until it is unlocked.<br>
 Type its password and Enter (it goes to the lock screen), or use a finger on the phone.
-<div id="lockkb"><div id="lockdots"></div></div></div><div id="info"><div id="ih"><span id="clock"></span><button id="ic">&minus;</button></div><div id="ib"><pre id="it"></pre><canvas id="tc" width="240" height="40"></canvas><div id="gl"></div><canvas id="gc" width="360" height="90"></canvas></div></div>
+<div id="lockkb"><div id="lockdots"></div></div></div><div id="info"><div id="ih"><span id="clock"></span><button id="ic">&minus;</button></div><div id="ib"><pre id="it"></pre><canvas id="tc" width="200" height="32"></canvas><div id="gl"></div><canvas id="gc" width="300" height="80"></canvas></div></div>
 <div id="gate"><div>The key shown on the phone</div>
 <input id="gk" autocapitalize="off" autocomplete="off" autocorrect="off"
  spellcheck="false" maxlength="16"><button id="go">OK</button><div id="gm"></div></div>
@@ -594,6 +594,9 @@ function tick() {
 document.getElementById("bi").onclick = () => {
   const on = info.style.display !== "block";
   info.style.display = on ? "block" : "none";
+  // Not moved yet: just below the bar, its top line clear of the buttons.
+  if (on && !info.style.top)
+    info.style.top = Math.round(document.getElementById("bar").getBoundingClientRect().bottom + 4) + "px";
   if (on) { tick(); drawTemps(); drawGraph(); }
 };
 document.getElementById("br").onclick = () => location.reload();
@@ -993,26 +996,37 @@ function graphPush(s) {
     if (graph[name].length > 120) graph[name].shift();
   }
 }
+// Axes: the time (2 min to now) below, and each curve's top value at the
+// left in its colour, its zero at the bottom line; half-way gridlines.
 function drawGraph() {
-  gctx.clearRect(0, 0, gc.width, gc.height);
+  const W = gc.width, H = gc.height, L = 34, B = 12, h = H - B - 2;
+  gctx.clearRect(0, 0, W, H);
+  gctx.font = "9px monospace"; gctx.textBaseline = "middle";
+  gctx.strokeStyle = "#555"; gctx.lineWidth = 1; gctx.beginPath();
+  for (const f of [0, 0.5, 1]) { gctx.moveTo(L, 1 + h - f * h); gctx.lineTo(W, 1 + h - f * h); }
+  gctx.moveTo(L, 1); gctx.lineTo(L, 1 + h);
+  gctx.stroke();
+  gctx.fillStyle = "#aaa"; gctx.textAlign = "center";
+  [["-2m", L], ["-1m", L + (W - L) / 2], ["now", W - 10]].forEach(([t, x]) => gctx.fillText(t, x, H - 5));
   gl.innerHTML = "";
-  for (const [name, color, label] of GRAPH) {
+  GRAPH.forEach(([name, color, label], n) => {
     const vals = graph[name], top = Math.max(1, ...vals.filter(x => x !== null));
-    gctx.strokeStyle = color; gctx.lineWidth = 2; gctx.beginPath();
+    gctx.fillStyle = color; gctx.textAlign = "right";
+    gctx.fillText(String(top), L - 3, 5 + n * 10);
+    gctx.strokeStyle = color; gctx.lineWidth = 1.5; gctx.beginPath();
     let pen = false;
     vals.forEach((x, i) => {
       if (x === null) { pen = false; return; }
-      const px = i * gc.width / 119, py = gc.height - 1 - x * (gc.height - 2) / top;
+      const px = L + (120 - vals.length + i) * (W - L) / 119, py = 1 + h - x * h / top;
       pen ? gctx.lineTo(px, py) : gctx.moveTo(px, py);
       pen = true;
     });
     gctx.stroke();
-    const now = vals.length ? vals[vals.length - 1] : null;
     const span = document.createElement("span");
     span.style.color = color;
-    span.textContent = `${label} ${now === null ? "?" : now} (top ${top})`;
+    span.textContent = label;
     gl.appendChild(span);
-  }
+  });
 }
 // INFO moves by its top line and folds by its button, apart from the bar;
 // kept in this browser.

@@ -139,8 +139,9 @@ sound_down() {
     rm -f "$sound_file"
 }
 
-# Dimmed, not blanked: a screen turned off is not captured.  Not when the
-# stream shows a screen of its own (wl-cast-screen): that one goes on.
+# Dimmed, not blanked: a screen turned off is not captured.  With a screen
+# of the stream's own (client, multi) too, the same key the same way
+# (author, 2026-11-22).
 dim() {
     case "${1:-}" in
         off)
@@ -152,7 +153,7 @@ dim() {
             done < "$touch_off"
             rm -f "$touch_off" ;;
         on)
-            running && [ -f "$dim_ok" ] && [ ! -s "$rt/wl-cast-output" ] || return 1
+            running && [ -f "$dim_ok" ] || return 1
             [ -f "$dimmed" ] && return 0
             brightnessctl -m | cut -d, -f3 > "$dimmed" && brightnessctl -q set 0
             if grep -q touch "$dim_ok"; then
