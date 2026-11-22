@@ -292,7 +292,7 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
 <div id="bar"><!--BUTTONS-->
 <button class="x" id="bi">INFO</button><button class="x" id="bv">HOST</button><button class="x" id="bu">MUTED</button>
 <button class="x" id="bm">VIDEO</button><button class="x" id="bt">TOUCH</button><button class="x" id="bd">DIM</button>
-<button class="x" id="bp">FREE</button><button class="x" id="by">SYNC</button><button class="x" id="bs">SET</button>
+<button class="x" id="bp">FREE</button><button class="x" id="by">AV SYNC</button><button class="x" id="bs">SET</button>
 <button class="x" id="bz">PAUSE</button><button class="x" id="bx">STOP</button><button class="x" id="br">RELOAD</button>
 <button id="bc"></button></div><div id="kbar"><!--KBUTTONS--></div>
 <div id="set">
@@ -515,7 +515,7 @@ function newDecoder() {
   if (decoder) try { decoder.close(); } catch (e) {}
   decoder = new VideoDecoder({
     output: f => {
-      // SYNC may hold the picture back (avNow negative).
+      // AV SYNC may hold the picture back to its buffer (syncHold).
       const draw = () => {
         if (c.width !== f.displayWidth || c.height !== f.displayHeight) {
           c.width = f.displayWidth; c.height = f.displayHeight;
@@ -529,7 +529,7 @@ function newDecoder() {
         f.close();
         dframes++;
       };
-      const hold = Math.max(0, -avNow());
+      const hold = cfg.sync && cfg.direct ? syncHold : 0;
       hold > 0 ? setTimeout(draw, hold) : draw();
     },
     error: e => {
@@ -678,33 +678,45 @@ function target(r, ms) {
   try { r.jitterBufferTarget = ms; } catch (x) {}
   try { r.playoutDelayHint = ms / 1000; } catch (x) {}
 }
-// The sound's offset against the picture: SET's a/v slider, or with SYNC
-// on, avAuto (below).  Positive holds the sound back, negative the picture.
-let avAuto = 0;
-const avNow = () => cfg.sync ? avAuto : cfg.av;
+// AV SYNC: picture and sound as on the host, for watching a video.  Both
+// are buffered to one total delay from the host to here, B: the later of
+// the two without buffering (the picture: the host's encoder, half the
+// round trip, decoding; the sound: the host's capture and Opus frame, half
+// the round trip) plus 300 ms, so that the browser's own jitter fits in.
+// B goes up at once when needed and down only after 10 s, so the buffers
+// stay put rather than chase every change.  Without it, SET's a/v slider.
+const SYNC_MARGIN = 300;
+let syncB = 0, syncLow = 0, syncV = 0, syncA = 0, syncHold = 0;
 function applyDelay() {
-  target(vrx, cfg.smooth + Math.max(0, -avNow()));
-  target(arx, cfg.smooth + Math.max(0, avNow()));
+  if (cfg.sync) {
+    target(vrx, syncV);
+    target(arx, syncA);
+    return;
+  }
+  target(vrx, cfg.smooth + Math.max(0, -cfg.av));
+  target(arx, cfg.smooth + Math.max(0, cfg.av));
 }
-// SYNC: picture and sound as on the host.  Each second, how late each is
-// from the host's screen and speaker to here: the picture's encoder,
-// half the round trip and its buffer (DIRECT: its age when drawn); the
-// sound's capture and Opus frame on the host, half the round trip and its
-// buffer.  The earlier one is held back by the difference, in steps of
-// at most 20 ms so that the buffers it changes settle.
 const by = document.getElementById("by");
 function showSync() { by.classList.toggle("held", !!cfg.sync); }
-by.onclick = () => { cfg.sync = !cfg.sync; save(); showSync(); applyDelay();
-                     log({ev: "setting", name: "sync", value: cfg.sync}); };
+by.onclick = () => {
+  cfg.sync = !cfg.sync; syncB = syncHold = 0; save(); showSync(); applyDelay();
+  log({ev: "setting", name: "sync", value: cfg.sync});
+};
 function syncStep(s) {
-  if (!cfg.sync || phone.audio_ms == null || s.audio_buffer_ms === undefined) return;
+  if (!cfg.sync || phone.audio_ms == null) return;
   const way = (s.rtt_ms || 0) / 2;
-  const video = cfg.direct ? s.age_ms : (phone.enc_ms == null || s.buffer_ms === undefined
-                                         ? undefined : phone.enc_ms + way + s.buffer_ms);
+  // DIRECT's picture: its age when drawn, less what is held here.
+  const video = cfg.direct ? (s.age_ms === undefined ? undefined : s.age_ms - syncHold)
+                           : (phone.enc_ms == null ? undefined : phone.enc_ms + way + 20);
   if (video === undefined) return;
-  const audio = phone.audio_ms + way + s.audio_buffer_ms;
-  const err = video - audio;
-  avAuto = Math.max(-1000, Math.min(1000, Math.round(avAuto + Math.max(-20, Math.min(20, err / 2)))));
+  const audio = phone.audio_ms + way;
+  const need = Math.round(Math.max(video, audio) + SYNC_MARGIN);
+  if (need > syncB) { syncB = need; syncLow = 0; }
+  else if (need < syncB - 50 && ++syncLow >= 10) { syncB = need; syncLow = 0; }
+  else if (need >= syncB - 50) syncLow = 0;
+  syncA = Math.max(0, Math.round(syncB - audio));
+  if (cfg.direct) { syncHold = Math.max(0, Math.round(syncB - video)); syncV = 0; }
+  else { syncV = Math.max(0, Math.round(syncB - video)); syncHold = 0; }
   applyDelay();
 }
 const sliders = [["ss", "smooth", applyDelay], ["sa", "av", applyDelay]];
@@ -1203,7 +1215,7 @@ setInterval(async () => {
   s.events = counts;
   s.temp = phone.cpu;
   syncStep(s);
-  if (cfg.sync) s.av_auto = avAuto;
+  if (cfg.sync) s.av_sync = {total: syncB, picture: cfg.direct ? syncHold : syncV, sound: syncA};
   graphPush(s);
   if (info.style.display === "block") {
     drawGraph();
@@ -1227,6 +1239,7 @@ setInterval(async () => {
       cfg.direct
         ? `latency ${s.age_ms === undefined ? "" : s.age_ms + " ms to drawn: "}${z(s.enc_ms)} encoder, ${way} network, ${rest === undefined ? 0 : rest} decoding and drawing`
         : `latency ${z(s.rtt_ms)} ms network round trip, ${z(s.buffer_ms)} ms video buffer, ${z(s.audio_buffer_ms)} ms sound`,
+      ...(cfg.sync ? [`av sync ${syncB} ms total: picture +${cfg.direct ? syncHold : syncV} ms, sound +${syncA} ms buffered`] : []),
       `phone   ${phone.cpu === undefined ? "" : phone.cpu + " \\u00b0C"}${phone.wifi_powersave ? ", Wi-Fi power saving " + phone.wifi_powersave : ""}`,
     ].join("\\n");
   }

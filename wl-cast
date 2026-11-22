@@ -188,8 +188,8 @@ pick_output() {
 
 # Every address a viewer can open the stream on, "ADDRESS<TAB>INTERFACE",
 # the default route's first: each network the host is on, its VPN
-# (Tailscale) and USB networking included, not loopback, containers or
-# bridges.  With -v hotspot, only the hotspot's (10.42.0.x, NetworkManager's
+# (Tailscale) and USB networking included, not loopback, containers,
+# bridges or mobile data (the carrier lets nobody in).  With -v hotspot, only the hotspot's (10.42.0.x, NetworkManager's
 # shared network): the server refuses the rest.
 addresses() {
     def=$(ip -4 route get 1.1.1.1 2>/dev/null |
@@ -197,6 +197,7 @@ addresses() {
     ip -4 -o addr show scope global |
         awk -v def="$def" -v hot="$1" '
             $2 ~ /^(lo|waydroid|veth|docker|br-|virbr|lxc)/ { next }
+            $2 ~ /^(rmnet|qmapmux|wwan|ccmni)/ { next }  # mobile data: behind the carrier
             { sub("/.*", "", $4) }
             hot == "hotspot" && $4 !~ /^10\.42\.0\./ { next }
             { print ($4 == def ? 0 : 1) "\t" $4 "\t" $2 }' |
