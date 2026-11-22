@@ -550,7 +550,17 @@ document.getElementById("bx").onclick = () => {
   send({t: "stop"});
   note("Stopped on the phone");
 };
-document.getElementById("bk").onclick = () => { k.focus(); log({ev: "keys-button"}); };
+// LKB opens this device's keyboard, and closes it when it is open.  The
+// press itself moves the focus, so whether it was open is read before.
+const bk = document.getElementById("bk");
+let kbWasOpen = false;
+bk.addEventListener("pointerdown", () => { kbWasOpen = document.activeElement === k; });
+bk.addEventListener("mousedown", e => e.preventDefault());
+bk.onclick = () => {
+  if (kbWasOpen) k.blur(); else k.focus();
+  kbWasOpen = false;
+  log({ev: "keys-button"});
+};
 // The screen mode: HOST (the phone's own), CLIENT (the phone at this
 // window's shape), MULTI (a second display).  Each press steps it; the
 // phone switches 2 s after the last press (author: rapid presses).
