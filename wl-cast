@@ -14,14 +14,24 @@
 #                several, in the terminal or by a click with slurp)
 #   -a ADDRESS   the address put in the links (default: the local
 #                network's, on the default route)
-#   -p PORT      HTTP port (8081); -t PORT: HTTPS port (8443)
+#   -p PORT      HTTP port (8081)
+#   -t PORT      HTTPS port (8443), for browsers that refuse plain HTTP
+#                (some cars'): it uses the certificate in
+#                /var/lib/wl-cast/tls if you put one there (wl-cast-cert
+#                gets one for a domain of yours), else a self-signed one
+#                made on first use, which the browser warns about once
 #   -k KEY       the key the link carries; -k '' for none.  Default: a random
 #                one, kept between runs so that a bookmark keeps working
-#   -r FPS       frame rate (30)
-#   -s SCREEN    phone (the screen as it is), client (a screen of the
-#                viewer's size) or multi-monitor (a second screen)
+#   -f FPS       frame rate (30)
+#   -s SCREEN    what the viewer sees: host (this screen as it is,
+#                the default), client (a screen made at the size of the
+#                viewer's window, which this screen's windows move to)
+#                or multi (a second screen beside this one)
 #   -A APPROVE   off, tap (a notification) or fingerprint, for a new viewer
-#   -v WHO       hotspot, lan (default) or wan: who may connect
+#   -v VISIBILITY  who can reach the stream: hotspot (only the devices on
+#                this machine's hotspot) or lan (default: any device that
+#                reaches its address).  wan is the same as lan for now:
+#                from outside, it takes a port your router forwards
 #   -w on|off    keep the screen awake while streaming (default on):
 #                through your hook if it does it, else swayidle paused
 #   -d           dim instead of blank: a screen turned off is not
@@ -29,8 +39,8 @@
 #                it black and back instead.  Bind your blanking key (the
 #                power key) to `wl-cast dim || <your blank command>': it
 #                then toggles dim while wl-cast streams this screen, and
-#                blanks as usual otherwise.  The brightness is back when
-#                the stream ends (brightnessctl)
+#                blanks as usual otherwise.  The dimmed brightness is back
+#                when the stream ends (brightnessctl)
 #   -T           with -d: the screen's own touch input off while dimmed
 #                (a phone in a pocket); the viewer's still works
 #   -h           this help
@@ -127,10 +137,11 @@ start() {
         key=$(LC_ALL=C tr -dc 'a-km-z2-9' < /dev/urandom 2>/dev/null | head -c 5)
         echo "$key" > "$key_file"
     fi
-    while getopts o:a:p:t:k:r:s:A:v:w:dTh o; do
+    while getopts o:a:p:t:k:f:s:A:v:w:dTh o; do
         case $o in
             o) WL_CAST_PANEL=$OPTARG ;; a) addr=$OPTARG ;; p) port=$OPTARG ;; t) tls=$OPTARG ;;
-            k) key=$OPTARG ;; r) fps=$OPTARG ;; s) screen=$OPTARG ;;
+            k) key=$OPTARG ;; f) fps=$OPTARG ;;
+            s) case $OPTARG in host) screen=phone ;; multi) screen=multi-monitor ;; *) screen=$OPTARG ;; esac ;;
             A) approve=$OPTARG ;; v) who=$OPTARG ;;
             w) [ "$OPTARG" = off ] && export WL_CAST_AWAKE=0 ;;
             d) dims="dim${dims#dim}" ;; T) dims="${dims:-dim} touch" ;; h) usage; exit ;;
