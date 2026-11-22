@@ -34,8 +34,10 @@
 #                second screen beside this one).  Default: the one last
 #                chosen on the page, else host
 #   -A APPROVE   off, tap (a notification) or fingerprint, for a new viewer
+#   -n           view only: picture and sound, no touch, keys or buttons
 #   -v VISIBILITY  who can reach the stream: hotspot (only the devices on
-#                this machine's hotspot) or lan (default: any device that
+#                this machine's hotspot), usb (only a computer on a USB
+#                cable, through USB networking) or lan (default: any device that
 #                reaches its address), or wan: also a public link, by
 #                Tailscale Funnel (https://<machine>.<tailnet>.ts.net/),
 #                for a viewer on no network of yours.  The key and -A
@@ -57,7 +59,8 @@
 #
 # wl-cast-server does the work; this only picks its arguments.
 # wf-recorder is the fallback when wl-cast-capture cannot run.  The
-# page's own buttons and the host's hook are in ~/.config/wl-cast
+# page's own buttons and the host's hook are in ~/.config/wl-cast, else
+# /etc/xdg/wl-cast (a distribution's defaults)
 # (README).
 set -u
 
@@ -200,6 +203,7 @@ addresses() {
             $2 ~ /^(rmnet|qmapmux|wwan|ccmni)/ { next }  # mobile data: behind the carrier
             { sub("/.*", "", $4) }
             hot == "hotspot" && $4 !~ /^10\.42\.0\./ { next }
+            hot == "usb" && $2 !~ /^(usb|rndis|ncm)/ { next }
             { print ($4 == def ? 0 : 1) "\t" $4 "\t" $2 }' |
         sort -s -k1,1 | cut -f2-
 }
@@ -235,7 +239,8 @@ start() {
         key=$(LC_ALL=C tr -dc 'a-km-z2-9' < /dev/urandom 2>/dev/null | head -c 5)
         echo "$key" > "$key_file"
     fi
-    while getopts o:a:p:t:k:f:s:A:v:w:dTh o; do
+    interactive=--interactive
+    while getopts o:a:p:t:k:f:s:A:v:w:dTnh o; do
         case $o in
             o) WL_CAST_PANEL=$OPTARG ;; a) addr=$OPTARG ;; p) port=$OPTARG ;; t) tls=$OPTARG ;;
             k) key=$OPTARG ;; f) fps=$OPTARG ;;
@@ -243,6 +248,7 @@ start() {
             A) approve=$OPTARG ;; v) who=$OPTARG ;;
             w) [ "$OPTARG" = off ] && export WL_CAST_AWAKE=0 ;;
             d) dims="dim${dims#dim}" ;; T) dims="${dims:-dim} touch" ;; h) usage; exit ;;
+            n) interactive= ;;
             *) usage >&2; exit 2 ;;
         esac
     done
@@ -273,7 +279,7 @@ start() {
     sound_up
     setsid wl-cast-server --raw "${w}x$h@$fps" ${key:+--key "$key"} --tls "$tls" \
         --screen "$screen" --approve "$approve" --visibility "$who" \
-        --portal "$turn" --interactive "$port" \
+        --portal "$turn" $interactive "$port" \
         wf-recorder -D -r "$fps" -F "$filter" -m rawvideo -c rawvideo -x nv12 -f pipe:1 -- \
         wf-recorder -D -r "$fps" -m ivf -c libvpx -x yuv420p -p deadline=realtime \
             -p cpu-used=8 -p threads=4 -p b=4000000 -p g="$fps" -f pipe:1 \
@@ -310,7 +316,9 @@ case "${1:-}" in
     status) running && cat "$links_file" ;;
     dim) dim "${2:-}" ;;
     screen)
-        [ -x "$HOME/.config/wl-cast/hook" ] && "$HOME/.config/wl-cast/hook" screen && exit 0
+        hook=${XDG_CONFIG_HOME:-$HOME/.config}/wl-cast/hook
+        [ -e "$hook" ] || hook=/etc/xdg/wl-cast/hook
+        [ -x "$hook" ] && "$hook" screen && exit 0
         dim && exit 0
         [ -n "${WL_CAST_PANEL:-}" ] && swaymsg "output $WL_CAST_PANEL power toggle" >/dev/null ;;
     pause) running && kill -USR1 "$(cat "$pid_file")" ;;

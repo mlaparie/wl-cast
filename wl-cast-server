@@ -47,6 +47,7 @@ real screen frames on the phone; not yet seen in a browser.
 import base64
 import hashlib
 import hmac
+import ipaddress
 import queue
 import json
 import select
@@ -87,10 +88,23 @@ PANEL = os.environ.get("WL_CAST_PANEL") or first_output()
 
 CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
                       "wl-cast")
+
+
+def config_file(name):
+    """CONFIG/NAME, else the first of XDG_CONFIG_DIRS that has wl-cast/NAME
+    (a distribution's defaults, /etc/xdg/wl-cast), else CONFIG/NAME."""
+    own = os.path.join(CONFIG, name)
+    if os.path.exists(own):
+        return own
+    for d in (os.environ.get("XDG_CONFIG_DIRS") or "/etc/xdg").split(":"):
+        path = os.path.join(d, "wl-cast", name)
+        if d and os.path.exists(path):
+            return path
+    return own
 # What is specific to a host goes through the owner's hook, CONFIG/hook
 # EVENT ARG... (README): keeping the screen awake, Wi-Fi power saving, the
 # host's gestures on the viewer's touches, a screen of its own removed.
-HOOK = os.path.join(CONFIG, "hook")
+HOOK = config_file("hook")
 
 
 def hook_code(*args):
@@ -120,7 +134,7 @@ def hook(*args, wait=True):
 
 def button_lines():
     try:
-        with open(os.path.join(CONFIG, "buttons")) as f:
+        with open(config_file("buttons")) as f:
             return [line.strip() for line in f]
     except OSError:
         return []
@@ -290,9 +304,9 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
 </style>
 <video id="v" autoplay muted playsinline></video><canvas id="c"></canvas>
 <div id="bar"><!--BUTTONS-->
-<button class="x" id="bi">INFO</button><button class="x" id="bv">HOST</button><button class="x" id="bu">MUTED</button>
+<button class="x" id="bi">INFO</button><button class="x" id="bv">HOST</button><button class="x" id="bu">MUTED</button><button class="x" id="by">AV SYNC</button>
 <button class="x" id="bm">VIDEO</button><button class="x" id="bt">TOUCH</button><button class="x" id="bd">DIM</button>
-<button class="x" id="bp">FREE</button><button class="x" id="by">AV SYNC</button><button class="x" id="bs">SET</button>
+<button class="x" id="bp">FREE</button><button class="x" id="bs">SET</button>
 <button class="x" id="bz">PAUSE</button><button class="x" id="bx">STOP</button><button class="x" id="br">RELOAD</button>
 <button id="bc"></button></div><div id="kbar"><!--KBUTTONS--></div>
 <div id="set">
@@ -682,10 +696,12 @@ function target(r, ms) {
 // are buffered to one total delay from the host to here, B: the later of
 // the two without buffering (the picture: the host's encoder, half the
 // round trip, decoding; the sound: the host's capture and Opus frame, half
-// the round trip) plus 300 ms, so that the browser's own jitter fits in.
-// B goes up at once when needed and down only after 10 s, so the buffers
-// stay put rather than chase every change.  Without it, SET's a/v slider.
-const SYNC_MARGIN = 300;
+// the round trip) plus a margin for the link's jitter: twice its worst
+// round trip of the last 30 s, 150 ms at least (a good Wi-Fi link, about
+// 200 ms in all; a jittery one more, rather than gaps and resyncs).  B goes
+// up at once when needed and down only after 10 s, so the buffers stay put
+// rather than chase every change.  Without it, SET's a/v slider.
+const rtts = [];
 let syncB = 0, syncLow = 0, syncV = 0, syncA = 0, syncHold = 0;
 function applyDelay() {
   if (cfg.sync) {
@@ -710,7 +726,9 @@ function syncStep(s) {
                            : (phone.enc_ms == null ? undefined : phone.enc_ms + way + 20);
   if (video === undefined) return;
   const audio = phone.audio_ms + way;
-  const need = Math.round(Math.max(video, audio) + SYNC_MARGIN);
+  if (s.rtt_ms !== undefined) { rtts.push(s.rtt_ms); if (rtts.length > 30) rtts.shift(); }
+  const margin = Math.min(2000, Math.max(150, 2 * Math.max(0, ...rtts)));
+  const need = Math.round(Math.max(video, audio) + margin);
   if (need > syncB) { syncB = need; syncLow = 0; }
   else if (need < syncB - 50 && ++syncLow >= 10) { syncB = need; syncLow = 0; }
   else if (need >= syncB - 50) syncLow = 0;
@@ -3499,6 +3517,22 @@ session = None
 session_lock = threading.Lock()
 
 
+def usb_networks():
+    """The IPv4 networks of the host's USB networking (a phone's gadget,
+    usb0, rndis0, ncm0), for --visibility usb."""
+    nets = []
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show", "scope", "global"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return nets
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) > 3 and f[1].startswith(("usb", "rndis", "ncm")):
+            nets.append(ipaddress.ip_network(f[3], strict=False))
+    return nets
+
+
 def audio_latency_ms():
     """The sound's delay on the host, from playing to sent: the source's
     latency (PipeWire's monitor and pulsesrc's block) and Opus's 20 ms
@@ -3986,14 +4020,24 @@ class Handler(BaseHTTPRequestHandler):
     key = ""          # --key: every request carries it as ?k=
     mbps = 6.0        # the encoder's bit rate, from the page
 
-    # --visibility hotspot: only the phone's hotspot (and the phone itself).
+    # --visibility hotspot: only the phone's hotspot (and the phone itself);
+    # usb: only a computer on a USB cable (USB networking), and the host.
     only_hotspot = False
+    only_nets = None
 
     def allowed(self):
+        ip = self.client_address[0]
         if self.only_hotspot:
-            ip = self.client_address[0]
             if not (ip.startswith("10.42.0.") or ip == "127.0.0.1"):
                 self.reply(b"forbidden: this stream is for the phone's hotspot only", code=403)
+                return False
+        if self.only_nets is not None:
+            try:
+                addr = ipaddress.ip_address(ip.removeprefix("::ffff:"))
+            except ValueError:
+                addr = None
+            if not (addr and (addr.is_loopback or any(addr in n for n in self.only_nets))):
+                self.reply(b"forbidden: this stream is for a USB cable only", code=403)
                 return False
         if not self.key:
             return True
@@ -4323,6 +4367,9 @@ def main():
     if args[:1] == ["--visibility"]:
         own_args.extend(args[:2])
         Handler.only_hotspot = args[1] == "hotspot"
+        if args[1] == "usb":
+            Handler.only_nets = usb_networks()
+            log_line("viewers on USB only: " + (", ".join(map(str, Handler.only_nets)) or "none yet"))
         args = args[2:]
     if args[:1] == ["--portal"] and SCREENCAST:
         # The helper captures by itself: no portal session.
