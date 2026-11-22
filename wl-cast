@@ -60,7 +60,7 @@
 # wl-cast-server does the work; this only picks its arguments.
 # wf-recorder is the fallback when wl-cast-capture cannot run.  The
 # page's own buttons and the host's hook are in ~/.config/wl-cast, else
-# /etc/xdg/wl-cast (a distribution's defaults)
+# in XDG_CONFIG_DIRS' wl-cast (a distribution's defaults, /etc/xdg)
 # (README).
 set -u
 
@@ -316,8 +316,12 @@ case "${1:-}" in
     status) running && cat "$links_file" ;;
     dim) dim "${2:-}" ;;
     screen)
+        # The user's hook, else a distribution's (XDG_CONFIG_DIRS).
         hook=${XDG_CONFIG_HOME:-$HOME/.config}/wl-cast/hook
-        [ -e "$hook" ] || hook=/etc/xdg/wl-cast/hook
+        if [ ! -e "$hook" ]; then
+            IFS=: read -ra dirs <<< "${XDG_CONFIG_DIRS:-/etc/xdg}"
+            for d in "${dirs[@]}"; do [ -e "$d/wl-cast/hook" ] && { hook=$d/wl-cast/hook; break; }; done
+        fi
         [ -x "$hook" ] && "$hook" screen && exit 0
         dim && exit 0
         [ -n "${WL_CAST_PANEL:-}" ] && swaymsg "output $WL_CAST_PANEL power toggle" >/dev/null ;;
