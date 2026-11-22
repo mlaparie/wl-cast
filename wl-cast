@@ -6,6 +6,10 @@
 #   wl-cast status              the links, if it runs
 #   wl-cast dim [on|off]        with start -d: turn the screen black, or
 #                               light it again (no argument: the other)
+#   wl-cast screen              the page's DIM button: as your power key
+#                               (hook screen), else dim, else this screen
+#                               off and on (with a screen of the stream's
+#                               own, nothing captures this one)
 #   wl-cast pause | play        hold the picture and sound, and go on: for
 #                               a call, from your phone's call handling
 #
@@ -290,6 +294,10 @@ case "${1:-}" in
     stop) stop ;;
     status) running && cat "$links_file" ;;
     dim) dim "${2:-}" ;;
+    screen)
+        [ -x "$HOME/.config/wl-cast/hook" ] && "$HOME/.config/wl-cast/hook" screen && exit 0
+        dim && exit 0
+        [ -n "${WL_CAST_PANEL:-}" ] && swaymsg "output $WL_CAST_PANEL power toggle" >/dev/null ;;
     pause) running && kill -USR1 "$(cat "$pid_file")" ;;
     play) running && kill -USR2 "$(cat "$pid_file")" ;;
     -h|--help|help) usage ;;

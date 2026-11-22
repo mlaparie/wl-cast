@@ -255,6 +255,10 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
 #info{position:fixed;left:6px;top:6px;font:14px monospace;color:#eee;
   background:rgba(0,0,0,.75);padding:8px;display:none;z-index:1}
 #info pre{margin:0;font:inherit}
+#ih{display:flex;justify-content:space-between;gap:12px;cursor:move;touch-action:none;user-select:none}
+#ic{font:14px monospace;background:#333;color:#eee;border:1px solid #555;padding:0 8px}
+#info.collapsed #ib{display:none}
+#gl{margin-top:6px}#gl span{margin-right:10px}
 #lockmsg,#callmsg{position:fixed;left:50%;top:40%;transform:translate(-50%,-50%);display:none;
   max-width:80%;padding:12px 16px;background:#000c;color:#fff;font:16px sans-serif;
   text-align:center;pointer-events:none;z-index:5}
@@ -283,11 +287,10 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
 </style>
 <video id="v" autoplay muted playsinline></video><canvas id="c"></canvas>
 <div id="bar"><!--BUTTONS-->
-<button class="x" id="bd">DIM</button><button class="x" id="bu">MUTED</button>
-<button class="x" id="bm">VIDEO</button><button class="x" id="bv">HOST</button><button class="x" id="bt">TOUCH</button>
-<button class="x" id="bp">FREE</button><button class="x" id="bs">SET</button>
-<button class="x" id="bi">INFO</button><button class="x" id="bz">PAUSE</button>
-<button class="x" id="bx">STOP</button><button class="x" id="br">RELOAD</button>
+<button class="x" id="bv">HOST</button><button class="x" id="bu">MUTED</button>
+<button class="x" id="bm">VIDEO</button><button class="x" id="bt">TOUCH</button><button class="x" id="bd">DIM</button>
+<button class="x" id="bp">FREE</button><button class="x" id="bi">INFO</button><button class="x" id="bs">SET</button>
+<button class="x" id="bz">PAUSE</button><button class="x" id="bx">STOP</button><button class="x" id="br">RELOAD</button>
 <button id="bc"></button></div><div id="kbar"><!--KBUTTONS--></div>
 <div id="set">
 <div class="h">now</div>
@@ -305,7 +308,7 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
 <button id="sy">RESYNC</button></div>
 <div id="note"></div><div id="callmsg">The phone is busy (a call): the stream is paused until it ends.</div><div id="lockmsg">The phone is locked: the picture stays still until it is unlocked.<br>
 Type its password and Enter (it goes to the lock screen), or use a finger on the phone.
-<div id="lockkb"><div id="lockdots"></div></div></div><div id="info"><div id="clock"></div><pre id="it"></pre><canvas id="tc" width="240" height="40"></canvas></div>
+<div id="lockkb"><div id="lockdots"></div></div></div><div id="info"><div id="ih"><span id="clock"></span><button id="ic">&minus;</button></div><div id="ib"><pre id="it"></pre><canvas id="tc" width="240" height="40"></canvas><div id="gl"></div><canvas id="gc" width="360" height="90"></canvas></div></div>
 <div id="gate"><div>The key shown on the phone</div>
 <input id="gk" autocapitalize="off" autocomplete="off" autocorrect="off"
  spellcheck="false" maxlength="16"><button id="go">OK</button><div id="gm"></div></div>
@@ -388,7 +391,7 @@ addEventListener("unhandledrejection", e =>
 // Moves (absolute pointer and touch) on the unordered, never-resent "fast"
 // channel: a lost one is outdated by the next.  The rest, reliable.
 let fast = null;
-// DIM: the host's screen black and back (wl-cast start -d).
+// DIM: the host's screen off or dimmed, as its power key (wl-cast screen).
 document.getElementById("bd").onclick = () => send({t: "dim"});
 // SUPER, CTRL and ALT on the bar: held for the next key or text typed,
 // for viewers whose keyboard lacks one or whose browser drops it (Android
@@ -591,7 +594,7 @@ function tick() {
 document.getElementById("bi").onclick = () => {
   const on = info.style.display !== "block";
   info.style.display = on ? "block" : "none";
-  if (on) { tick(); drawTemps(); }
+  if (on) { tick(); drawTemps(); drawGraph(); }
 };
 document.getElementById("br").onclick = () => location.reload();
 // PAUSE: the phone sends nothing and its encoder idles (cooler); PLAY:
@@ -971,6 +974,75 @@ function drawTemps() {
   });
   tctx.stroke();
 }
+// INFO's curves over the last 2 minutes, each to its own scale, with
+// their legend: frames shown a second, frames dropped a second (skipped
+// in DIRECT), latency (DIRECT: a frame's age when drawn; VIDEO: network
+// round trip and the browser's buffer).
+const graph = {fps: [], dropped: [], latency: []};
+const gc = document.getElementById("gc"), gctx = gc.getContext("2d"), gl = document.getElementById("gl");
+const GRAPH = [["fps", "#6c6", "fps"], ["dropped", "#e55", "dropped/s"], ["latency", "#69f", "latency ms"]];
+let lastDropped = null;
+function graphPush(s) {
+  const all = cfg.direct ? s.skipped : s.dropped;
+  const dropped = all === undefined || lastDropped === null ? 0 : Math.max(0, all - lastDropped);
+  if (all !== undefined) lastDropped = all;
+  const latency = cfg.direct ? s.age_ms
+    : s.rtt_ms === undefined ? undefined : s.rtt_ms + (s.buffer_ms || 0);
+  for (const [name, value] of [["fps", s.fps], ["dropped", dropped], ["latency", latency]]) {
+    graph[name].push(value === undefined ? null : value);
+    if (graph[name].length > 120) graph[name].shift();
+  }
+}
+function drawGraph() {
+  gctx.clearRect(0, 0, gc.width, gc.height);
+  gl.innerHTML = "";
+  for (const [name, color, label] of GRAPH) {
+    const vals = graph[name], top = Math.max(1, ...vals.filter(x => x !== null));
+    gctx.strokeStyle = color; gctx.lineWidth = 2; gctx.beginPath();
+    let pen = false;
+    vals.forEach((x, i) => {
+      if (x === null) { pen = false; return; }
+      const px = i * gc.width / 119, py = gc.height - 1 - x * (gc.height - 2) / top;
+      pen ? gctx.lineTo(px, py) : gctx.moveTo(px, py);
+      pen = true;
+    });
+    gctx.stroke();
+    const now = vals.length ? vals[vals.length - 1] : null;
+    const span = document.createElement("span");
+    span.style.color = color;
+    span.textContent = `${label} ${now === null ? "?" : now} (top ${top})`;
+    gl.appendChild(span);
+  }
+}
+// INFO moves by its top line and folds by its button, apart from the bar;
+// kept in this browser.
+{
+  const ih = document.getElementById("ih"), ic = document.getElementById("ic");
+  const keepInfo = () => {
+    try { localStorage.setItem("wl-cast-info", JSON.stringify(
+      {left: info.style.left, top: info.style.top, folded: info.classList.contains("collapsed")})); } catch (e) {}
+  };
+  try {
+    const was = JSON.parse(localStorage.getItem("wl-cast-info") || "null");
+    if (was) { info.style.left = was.left || ""; info.style.top = was.top || "";
+               info.classList.toggle("collapsed", !!was.folded); }
+  } catch (e) {}
+  let drag = null;
+  ih.addEventListener("pointerdown", e => {
+    if (e.target === ic) return;
+    drag = {x: e.clientX - info.offsetLeft, y: e.clientY - info.offsetTop};
+    ih.setPointerCapture(e.pointerId);
+  });
+  ih.addEventListener("pointermove", e => {
+    if (!drag) return;
+    info.style.left = Math.max(0, Math.min(innerWidth - 40, e.clientX - drag.x)) + "px";
+    info.style.top = Math.max(0, Math.min(innerHeight - 20, e.clientY - drag.y)) + "px";
+  });
+  const drop = () => { if (drag) { drag = null; keepInfo(); } };
+  ih.addEventListener("pointerup", drop);
+  ih.addEventListener("pointercancel", drop);
+  ic.onclick = () => { info.classList.toggle("collapsed"); keepInfo(); };
+}
 let phone = {}, ticks = 0;
 // A screen of its own not of this window's shape: fitted at once, at the
 // same long side, once per shape (a refusal does not loop).
@@ -1066,7 +1138,9 @@ setInterval(async () => {
   s.settings = {smooth: cfg.smooth, av: cfg.av, mbps: cfg.rate, fps: cfg.fps, muted: v.muted};
   s.events = counts;
   s.temp = phone.cpu;
+  graphPush(s);
   if (info.style.display === "block") {
+    drawGraph();
     const ev = Object.entries(counts).map(([a, b]) => a + " " + b);
     const rows = [];
     for (let i = 0; i < ev.length; i += 3) rows.push("  " + ev.slice(i, i + 3).join("  "));
@@ -1131,7 +1205,7 @@ function mouseMove(e) {
 let triple = false;
 function press(e) {
   if (captured) return;
-  if (e.target.closest && e.target.closest("#bar, #kbar, #set, #gate, #lockkb")) return;
+  if (e.target.closest && e.target.closest("#bar, #kbar, #set, #gate, #lockkb, #info")) return;
   e.preventDefault();
   if (e.pointerType === "mouse" && cfg.input === "mouse") {
     const n = norm(e);
@@ -1225,7 +1299,7 @@ function move(e) {
 }
 function release(e) {
   if (e.pointerType === "mouse" && cfg.input === "mouse" && !captured && e.type === "pointerup") {
-    if (e.target.closest && e.target.closest("#bar, #kbar, #set, #gate, #lockkb")) return;
+    if (e.target.closest && e.target.closest("#bar, #kbar, #set, #gate, #lockkb, #info")) return;
     if (e.button === 0) send({t: "up"});
     else send({t: "rbtn", b: MOUSE[e.button] || "left", d: 0});
     return;
@@ -1326,7 +1400,7 @@ document.addEventListener("mousemove", e => {
   if (holdTimer && (holdMoved += Math.abs(e.movementX) + Math.abs(e.movementY)) > 30) holdEnd();
 });
 // The buttons' own: a touch on them makes mouse events too.
-const onButtons = e => e.target.closest && e.target.closest("#bar, #kbar, #set, #gate, #lockkb");
+const onButtons = e => e.target.closest && e.target.closest("#bar, #kbar, #set, #gate, #lockkb, #info");
 document.addEventListener("mousedown", e => {
   if (!captured || onButtons(e)) return;
   e.preventDefault();
@@ -2900,8 +2974,8 @@ class Remote:
                 self.touch_event(kind, m.get("id"), m.get("x", 0.0), m.get("y", 0.0))
                 return
             if kind == "dim":
-                # The host's screen black and back; only with wl-cast start -d.
-                subprocess.Popen(["wl-cast", "dim"], stdin=subprocess.DEVNULL,
+                # The host's screen as its power key does (wl-cast screen).
+                subprocess.Popen(["wl-cast", "screen"], stdin=subprocess.DEVNULL,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 return
             if kind == "action":

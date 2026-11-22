@@ -13,6 +13,9 @@
 #                    with the stream.
 #   screen-gone OUTPUT  the viewer's own screen was removed; move back what
 #                    you put there.
+#   screen           the page's DIM button: do what your power key does
+#                    (e.g. your-power-key-script).  Exit 1 to let wl-cast
+#                    dim (with start -d) or turn the screen off and on.
 #
 # Anything else: exit 1.
 
@@ -28,5 +31,7 @@ case "$1" in
         exit 1 ;;
     screen-gone)
         exit 0 ;;
+    screen)
+        exit 1 ;;
 esac
 exit 1
