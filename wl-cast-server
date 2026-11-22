@@ -266,6 +266,7 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
   border-radius:0;padding:4px 7px}
 #bar.folded .x,#bar.folded ~ #kbar .x{display:none}
 #kbar button.held,#bar button.held{background:#875;color:#fff}
+#bar[data-view] .host,#bar[data-view] ~ #kbar{display:none}
 #info{position:fixed;left:6px;top:40px;font:11px monospace;color:#eee;
   background:rgba(0,0,0,.75);padding:8px;display:none;z-index:1}
 #info pre{margin:0;font:inherit}
@@ -304,10 +305,10 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
 </style>
 <video id="v" autoplay muted playsinline></video><canvas id="c"></canvas>
 <div id="bar"><!--BUTTONS-->
-<button class="x" id="bi">INFO</button><button class="x" id="bv">HOST</button><button class="x" id="bu">MUTED</button><button class="x" id="by">AV SYNC</button>
-<button class="x" id="bm">VIDEO</button><button class="x" id="bt">TOUCH</button><button class="x" id="bd">DIM</button>
-<button class="x" id="bp">FREE</button><button class="x" id="bs">SET</button>
-<button class="x" id="bz">PAUSE</button><button class="x" id="bx">STOP</button><button class="x" id="br">RELOAD</button>
+<button class="x" id="bi">INFO</button><button class="x host" id="bv">HOST</button><button class="x" id="bu">MUTED</button><button class="x" id="by">AV SYNC</button>
+<button class="x" id="bm">VIDEO</button><button class="x" id="bt">TOUCH</button><button class="x host" id="bd">DIM</button>
+<button class="x host" id="bp">FREE</button><button class="x" id="bs">SET</button>
+<button class="x" id="bz">PAUSE</button><button class="x host" id="bx">STOP</button><button class="x" id="br">RELOAD</button>
 <button id="bc"></button></div><div id="kbar"><!--KBUTTONS--></div>
 <div id="set">
 <div class="h">now</div>
@@ -3235,6 +3236,10 @@ class PanelTouch:
 
 panel_touch = None
 remote = None
+# --view-only: the page without what acts on the host (its keyboard bar,
+# the screen mode, DIM, FREE, STOP), and refused here as well whatever the
+# page sends: input, buttons, DIM and STOP on the channel, /screen.
+VIEW_ONLY = False
 LOG = os.path.join(os.environ.get("XDG_STATE_HOME")
                    or os.path.expanduser("~/.local/state"),
                    "wl-cast", "stream.log")
@@ -3358,7 +3363,7 @@ class Session:
         and STOP buttons."""
         if '"t":"pause"' in text or '"t":"play"' in text:
             GLib.idle_add(self.pause, '"t":"pause"' in text)
-        elif '"t":"stop"' in text:
+        elif '"t":"stop"' in text and not VIEW_ONLY:
             log_line("stopped by the viewer")
             GLib.timeout_add(300, lambda: os.kill(os.getpid(), signal.SIGTERM) and False)
         elif '"t":"keyframe"' in text:
@@ -3370,7 +3375,7 @@ class Session:
             except (ValueError, KeyError, TypeError):
                 return
             GLib.idle_add(self.bitrate, min(20.0, max(0.5, mbps)))
-        else:
+        elif not VIEW_ONLY:
             remote.handle(text)
 
     def pause(self, on):
@@ -4064,7 +4069,11 @@ class Handler(BaseHTTPRequestHandler):
         # The page itself asks for the key, so it comes without one.
         if path == "/":
             top, bottom = buttons_html()
-            self.reply(INTERACTIVE_PAGE.replace(b"<!--BUTTONS-->", top)
+            page = INTERACTIVE_PAGE
+            if VIEW_ONLY:
+                page = page.replace(b'<div id="bar">', b'<div id="bar" data-view>')
+                top = bottom = b""
+            self.reply(page.replace(b"<!--BUTTONS-->", top)
                        .replace(b"<!--KBUTTONS-->", bottom)
                        if remote else PAGE,
                        "text/html; charset=utf-8")
@@ -4162,6 +4171,11 @@ class Handler(BaseHTTPRequestHandler):
         if not self.allowed():
             return
         path = self.path.split("?")[0]
+        # View only: nothing that changes the host's desktop (the screen
+        # mode moves its windows), whatever the page sends.
+        if VIEW_ONLY and path == "/screen":
+            self.reply(b"view only", code=403)
+            return
         if path == "/screen":
             # The page's screen mode button: kept as the menu's setting, the
             # old screen taken down, the server started again with the new.
@@ -4260,7 +4274,7 @@ class Handler(BaseHTTPRequestHandler):
                 json.dump(kept, f)
             os.replace(SETTINGS + ".new", SETTINGS)
             if producer:
-                producer.steady = bool(kept.get("steady", True))
+                producer.steady = bool(kept.get("steady", False))
                 producer.adaptive = bool(kept.get("adaptive", True))
                 if not producer.adaptive:
                     producer.limit = producer.fps
@@ -4328,7 +4342,7 @@ def main():
     if sys.argv[1:2] == ["udp"] and len(sys.argv) > 5:
         send_udp(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:])
         return
-    global remote, portal, producer
+    global remote, portal, producer, VIEW_ONLY
     args = sys.argv[1:]
     if args[:1] == ["--raw"]:
         Handler.size, args = args[1], args[2:]
@@ -4417,6 +4431,10 @@ def main():
     # Held by the server before a reexec, and still held.
     wifi_held[0] = os.environ.pop("WL_CAST_WIFI", "") == "1"
     wifi_hold(bool(kept_setting("wifi_awake", True)))
+    if args[:1] == ["--view-only"]:
+        own_args.append("--view-only")
+        VIEW_ONLY = True
+        args = args[1:]
     if args[:1] == ["--interactive"]:
         own_args.append("--interactive")
         args = args[1:]
