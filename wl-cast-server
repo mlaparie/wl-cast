@@ -673,8 +673,11 @@ function sound(on) {
 }
 bu.onclick = () => { cfg.sound = v.muted; save(); sound(cfg.sound); };
 let touched = false;
+// Cromite refuses even a muted autoplay until the page is touched
+// (play-failed, black picture, 2026-11-22): the first touch plays it.
 addEventListener("pointerdown", e => {
   if (!touched && e.target !== bu && cfg.sound && v.muted) sound(true);
+  else if (v.paused && v.srcObject) v.play().catch(() => {});
   touched = true;
 }, {capture: true});
 // The Pro1x's own menus and on-screen keyboard (special keys), on its screen.
