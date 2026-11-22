@@ -2603,8 +2603,10 @@ producer = None
 # dropping or repeating samples (slave-method's default, skew, clicks).
 # 96 kbit/s with in-band FEC: cheaper on Wi-Fi, and a lost packet is rebuilt
 # from the next one rather than concealed.
+# WL_CAST_SOUND: another source, Stream viewer's monitor (wl-cast).
 AUDIO = (
-    "pulsesrc device=@DEFAULT_MONITOR@ buffer-time=200000 latency-time=20000 "
+    f"pulsesrc device={os.environ.get('WL_CAST_SOUND') or '@DEFAULT_MONITOR@'} "
+    "buffer-time=200000 latency-time=20000 "
     "slave-method=re-timestamp ! valve name=av ! "
     "audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! "
     "opusenc bitrate=96000 frame-size=20 inband-fec=true packet-loss-percentage=5 ! "

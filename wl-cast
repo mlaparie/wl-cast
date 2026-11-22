@@ -23,10 +23,11 @@
 #   -k KEY       the key the link carries; -k '' for none.  Default: a random
 #                one, kept between runs so that a bookmark keeps working
 #   -f FPS       frame rate (30)
-#   -s SCREEN    what the viewer sees: host (this screen as it is,
-#                the default), client (a screen made at the size of the
-#                viewer's window, which this screen's windows move to)
-#                or multi (a second screen beside this one)
+#   -s SCREEN    what the viewer sees: host (this screen as it is),
+#                client (a screen made at the size of the viewer's
+#                window, which this screen's windows move to) or multi (a
+#                second screen beside this one).  Default: the one last
+#                chosen on the page, else host
 #   -A APPROVE   off, tap (a notification) or fingerprint, for a new viewer
 #   -v VISIBILITY  who can reach the stream: hotspot (only the devices on
 #                this machine's hotspot) or lan (default: any device that
@@ -65,6 +66,7 @@ touch_off=$rt/wl-cast.touch-off         # the touch devices turned off
 key_file=$state/key
 
 funnel=$rt/wl-cast.funnel                # -v wan: Funnel was turned on
+sound_file=$rt/stream-audio              # the stream's outputs (sound_up)
 
 running() { [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; }
 
@@ -81,11 +83,56 @@ stop() {
     rm -f "$pid_file" "$links_file"
     [ -f "$funnel" ] && tailscale funnel --https=443 off >/dev/null 2>&1
     rm -f "$funnel"
+    sound_down
     dim off
     rm -f "$dim_ok"
     # swayidle paused by a server that did not end cleanly.
     [ -f "$rt/wl-cast-idle-stopped" ] && xargs kill -CONT < "$rt/wl-cast-idle-stopped" 2>/dev/null
     rm -f "$rt/wl-cast-idle-stopped"
+}
+
+# The stream's sound has an output of its own, "Stream viewer", so that
+# the host's sound settings choose where it plays: the host's output alone
+# (host only), Stream viewer alone (the viewer only), or both, as at start
+# (a combined output, the default until the stream ends).  The server
+# sends what plays on Stream viewer.  $sound_file: the modules, then the
+# host's output, for sound_down and for the host's settings (the Pro¹x's
+# quick actions read it).  Without pactl: the default output's sound, as
+# before.
+set_sink() {                    # the current default, not a remembered one
+    if command -v pw-metadata >/dev/null; then
+        pw-metadata 0 default.audio.sink "{ \"name\": \"$1\" }" Spa:String:JSON >/dev/null
+    else
+        pactl set-default-sink "$1"
+    fi
+}
+sound_up() {
+    command -v pactl >/dev/null || return 0
+    host=$(pactl get-default-sink 2>/dev/null) || return 0
+    case "$host" in ""|wl_cast_*) return 0 ;; esac
+    viewer=$(pactl load-module module-null-sink sink_name=wl_cast_viewer \
+                 "sink_properties='device.description=\"Stream viewer\"'") || return 0
+    both=$(pactl load-module module-combine-sink sink_name=wl_cast_both \
+               slaves="$host,wl_cast_viewer" \
+               "sink_properties='device.description=\"Host and stream viewer\"'") ||
+        { pactl unload-module "$viewer"; return 0; }
+    printf '%s %s\n%s\n' "$viewer" "$both" "$host" > "$sound_file"
+    # PipeWire picks the default again once a new output is ready: set it
+    # until it holds (2 s at most).
+    for _ in 1 2 3 4 5 6 7 8; do
+        [ "$(pactl get-default-sink)" = wl_cast_both ] && break
+        set_sink wl_cast_both; sleep 0.25
+    done
+    export WL_CAST_SOUND=wl_cast_viewer.monitor
+}
+sound_down() {
+    [ -f "$sound_file" ] || return 0
+    { read -r mods; read -r host; } < "$sound_file"
+    case "$(pactl get-default-sink 2>/dev/null)" in
+        wl_cast_*) set_sink "$host" ;;
+    esac
+    for m in $mods; do pactl unload-module "$m" 2>/dev/null; done
+    rm -f "$sound_file"
 }
 
 # Dimmed, not blanked: a screen turned off is not captured.  Not when the
@@ -164,7 +211,10 @@ funnel_missing() {
 }
 
 start() {
-    addr= port=8081 tls=8443 fps=30 screen=phone approve=off who=lan dims=
+    addr= port=8081 tls=8443 fps=30 approve=off who=lan dims=
+    # The screen mode last chosen on the page (its button), unless -s.
+    screen=$(cat "${XDG_STATE_HOME:-$HOME/.local/state}/wl-cast-screen" 2>/dev/null)
+    case "$screen" in phone|client|multi-monitor) ;; *) screen=phone ;; esac
     key=$(cat "$key_file" 2>/dev/null)
     if [ -z "$key" ]; then
         mkdir -p "$state"
@@ -205,6 +255,7 @@ start() {
     case "$turn" in *90|*270) filter="scale=$h:$w" ;; *) filter="scale=$w:$h" ;; esac
 
     stop
+    sound_up
     setsid wl-cast-server --raw "${w}x$h@$fps" ${key:+--key "$key"} --tls "$tls" \
         --screen "$screen" --approve "$approve" --visibility "$who" \
         --portal "$turn" --interactive "$port" \
@@ -214,7 +265,7 @@ start() {
         >/dev/null 2>&1 </dev/null &
     echo $! > "$pid_file"
     sleep 1
-    running || { rm -f "$pid_file"; echo "wl-cast: the server did not start" >&2; exit 1; }
+    running || { rm -f "$pid_file"; sound_down; echo "wl-cast: the server did not start" >&2; exit 1; }
     # Funnel serves the HTTP port as https://<name>/, until the server ends
     # (by stop, or the watcher if it dies).
     public=

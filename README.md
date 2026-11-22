@@ -22,6 +22,8 @@ The page has a few buttons of its own (sound, keyboard, settings). Add yours in 
 
 Everything specific to your host goes in an optional `~/.config/wl-cast/hook` script, see `examples/hook`: keeping the screen awake, Wi-Fi power saving, and your gesture tool on the viewer's touches, so edge swipes work from the stream as they do on the screen for instance.
 
+While it streams, the sound plays on your output and on a new one, "Stream viewer", which is what the viewer hears: pick your own output alone in your sound settings to keep the sound on the host, Stream viewer alone to hear it only on the viewer's side. Both come back as before when the stream ends (it needs `pactl`). Without `-s`, the stream starts in the screen mode last chosen on the page.
+
 The screen stays awake while streaming (`-w off` to let it blank), through your hook or else by pausing swayidle. A screen turned off is not captured, so with `wl-cast start -d`, the key that normally blanks it (the power key, bound to `wl-cast dim || <your blank command>`) toggles a black screen instead while the stream runs, and blanks as usual otherwise. `-T` also turns the screen's own touch input off while dimmed. The brightness comes back when the stream ends.
 
 By default any device that reaches the host's address can open the link (`-v lan`); `-v hotspot` keeps it to the host's own hotspot. `-v wan` also prints a public link through Tailscale Funnel, for a viewer on none of your networks: the key in the link and `-A` (approval on the host) guard it. `wl-cast start -v wan` says what Tailscale still needs. The page goes through Funnel; the video still takes the most direct way WebRTC finds.
