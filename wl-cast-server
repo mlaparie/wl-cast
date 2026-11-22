@@ -292,7 +292,7 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
 <div id="bar"><!--BUTTONS-->
 <button class="x" id="bi">INFO</button><button class="x" id="bv">HOST</button><button class="x" id="bu">MUTED</button>
 <button class="x" id="bm">VIDEO</button><button class="x" id="bt">TOUCH</button><button class="x" id="bd">DIM</button>
-<button class="x" id="bp">FREE</button><button class="x" id="bs">SET</button>
+<button class="x" id="bp">FREE</button><button class="x" id="by">SYNC</button><button class="x" id="bs">SET</button>
 <button class="x" id="bz">PAUSE</button><button class="x" id="bx">STOP</button><button class="x" id="br">RELOAD</button>
 <button id="bc"></button></div><div id="kbar"><!--KBUTTONS--></div>
 <div id="set">
@@ -359,7 +359,7 @@ function vp8IfNothing(pc, reload) {
 }
 const withKey = path =>
   key ? path + (path.includes("?") ? "&" : "?") + "k=" + encodeURIComponent(key) : path;
-const cfg = Object.assign({smooth: 50, av: 0, rate: 6, fps: 30, heat: 70, sound: true, input: "touch", steady: false, adaptive: true, wifi_awake: true,
+const cfg = Object.assign({smooth: 50, av: 0, rate: 6, fps: 30, heat: 70, sound: true, input: "touch", steady: false, sync: false, adaptive: true, wifi_awake: true,
                            canvas: false, direct: false, folded: false}, store.get("settings", {}));
 if (P.get("mode")) {
   cfg.canvas = P.get("mode") === "canvas";
@@ -515,17 +515,22 @@ function newDecoder() {
   if (decoder) try { decoder.close(); } catch (e) {}
   decoder = new VideoDecoder({
     output: f => {
-      if (c.width !== f.displayWidth || c.height !== f.displayHeight) {
-        c.width = f.displayWidth; c.height = f.displayHeight;
-      }
-      ctx.drawImage(f, 0, 0);
-      const sent = sentAt.get(f.timestamp);
-      if (sent !== undefined) {
-        sentAt.delete(f.timestamp);
-        ageSum += Date.now() + clockOffset - sent; ageN++;
-      }
-      f.close();
-      dframes++;
+      // SYNC may hold the picture back (avNow negative).
+      const draw = () => {
+        if (c.width !== f.displayWidth || c.height !== f.displayHeight) {
+          c.width = f.displayWidth; c.height = f.displayHeight;
+        }
+        ctx.drawImage(f, 0, 0);
+        const sent = sentAt.get(f.timestamp);
+        if (sent !== undefined) {
+          sentAt.delete(f.timestamp);
+          ageSum += Date.now() + clockOffset - sent; ageN++;
+        }
+        f.close();
+        dframes++;
+      };
+      const hold = Math.max(0, -avNow());
+      hold > 0 ? setTimeout(draw, hold) : draw();
     },
     error: e => {
       log({ev: "decoder-error", err: String(e)});
@@ -673,9 +678,34 @@ function target(r, ms) {
   try { r.jitterBufferTarget = ms; } catch (x) {}
   try { r.playoutDelayHint = ms / 1000; } catch (x) {}
 }
+// The sound's offset against the picture: SET's a/v slider, or with SYNC
+// on, avAuto (below).  Positive holds the sound back, negative the picture.
+let avAuto = 0;
+const avNow = () => cfg.sync ? avAuto : cfg.av;
 function applyDelay() {
-  target(vrx, cfg.smooth + Math.max(0, -cfg.av));
-  target(arx, cfg.smooth + Math.max(0, cfg.av));
+  target(vrx, cfg.smooth + Math.max(0, -avNow()));
+  target(arx, cfg.smooth + Math.max(0, avNow()));
+}
+// SYNC: picture and sound as on the host.  Each second, how late each is
+// from the host's screen and speaker to here: the picture's encoder,
+// half the round trip and its buffer (DIRECT: its age when drawn); the
+// sound's capture and Opus frame on the host, half the round trip and its
+// buffer.  The earlier one is held back by the difference, in steps of
+// at most 20 ms so that the buffers it changes settle.
+const by = document.getElementById("by");
+function showSync() { by.classList.toggle("held", !!cfg.sync); }
+by.onclick = () => { cfg.sync = !cfg.sync; save(); showSync(); applyDelay();
+                     log({ev: "setting", name: "sync", value: cfg.sync}); };
+function syncStep(s) {
+  if (!cfg.sync || phone.audio_ms == null || s.audio_buffer_ms === undefined) return;
+  const way = (s.rtt_ms || 0) / 2;
+  const video = cfg.direct ? s.age_ms : (phone.enc_ms == null || s.buffer_ms === undefined
+                                         ? undefined : phone.enc_ms + way + s.buffer_ms);
+  if (video === undefined) return;
+  const audio = phone.audio_ms + way + s.audio_buffer_ms;
+  const err = video - audio;
+  avAuto = Math.max(-1000, Math.min(1000, Math.round(avAuto + Math.max(-20, Math.min(20, err / 2)))));
+  applyDelay();
 }
 const sliders = [["ss", "smooth", applyDelay], ["sa", "av", applyDelay]];
 // Rate, fps and size restart the phone's capture: kept here until APPLY,
@@ -798,7 +828,7 @@ ad.onchange = () => { cfg.adaptive = ad.checked; save(); log({ev: "setting", nam
 const wp = document.getElementById("wp");
 wp.onchange = () => { cfg.wifi_awake = wp.checked; save(); log({ev: "setting", name: "wifi_awake", value: cfg.wifi_awake}); };
 st.onchange = () => { cfg.steady = st.checked; save(); log({ev: "setting", name: "steady", value: cfg.steady}); };
-function refresh() { showHeat(); showFps(); showRate(); showSteady(); showMode(); showInput(); showFold(); showSliders(); showSound(); applyDelay(); }
+function refresh() { showSync(); showHeat(); showFps(); showRate(); showSteady(); showMode(); showInput(); showFold(); showSliders(); showSound(); applyDelay(); }
 refresh();
 
 const pc = new RTCPeerConnection();
@@ -1172,6 +1202,8 @@ setInterval(async () => {
   s.settings = {smooth: cfg.smooth, av: cfg.av, mbps: cfg.rate, fps: cfg.fps, muted: v.muted};
   s.events = counts;
   s.temp = phone.cpu;
+  syncStep(s);
+  if (cfg.sync) s.av_auto = avAuto;
   graphPush(s);
   if (info.style.display === "block") {
     drawGraph();
@@ -2743,6 +2775,7 @@ class Screencast(Producer):
             enc = sorted(self.bench["encoder"])
             self.bench["encoder"].clear()
         if enc:
+            self.enc_median = enc[len(enc) // 2]
             log_line(f"delay ms, Sway's frame to encoded (median/worst): "
                      f"{enc[len(enc) // 2]}/{enc[-1]}")
         return GLib.SOURCE_CONTINUE
@@ -2777,7 +2810,7 @@ producer = None
 # from the next one rather than concealed.
 # WL_CAST_SOUND: another source, Stream viewer's monitor (wl-cast).
 AUDIO = (
-    f"pulsesrc device={os.environ.get('WL_CAST_SOUND') or '@DEFAULT_MONITOR@'} "
+    f"pulsesrc name=asrc device={os.environ.get('WL_CAST_SOUND') or '@DEFAULT_MONITOR@'} "
     "buffer-time=200000 latency-time=20000 "
     "slave-method=re-timestamp ! valve name=av ! "
     "audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! "
@@ -3453,6 +3486,20 @@ session = None
 session_lock = threading.Lock()
 
 
+def audio_latency_ms():
+    """The sound's delay on the host, from playing to sent: the source's
+    latency (PipeWire's monitor and pulsesrc's block) and Opus's 20 ms
+    frame.  For the page's SYNC; None before a viewer."""
+    try:
+        src = session.pipeline.get_by_name("asrc")
+        query = Gst.Query.new_latency()
+        if src is not None and src.query(query):
+            return round(query.parse_latency()[1] / 1e6) + 20
+    except AttributeError:
+        pass
+    return None
+
+
 def cpu_temperature():
     """The hottest CPU sensor, in degrees, or None."""
     hottest = None
@@ -3984,6 +4031,8 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(b"ok")
         elif path == "/status":
             self.reply(json.dumps({"now": int(time.time() * 1000),
+                                   "enc_ms": getattr(producer, "enc_median", None),
+                                   "audio_ms": audio_latency_ms(),
                                    "cpu": cpu_temperature(),
                                    "fps": capture_fps(),
                                    "target": Handler.target,

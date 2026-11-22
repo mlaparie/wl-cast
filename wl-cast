@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # wl-cast — start and stop the browser stream of this screen.
 #
-#   wl-cast start [OPTION...]   start it and print its links
+#   wl-cast start [OPTION...]   start it and print its links: every address
+#                               -v allows, with its interface
 #   wl-cast stop
 #   wl-cast status              the links, if it runs
 #   wl-cast dim [on|off]        with start -d: turn the screen black, or
@@ -185,14 +186,21 @@ pick_output() {
     fi
 }
 
-# The one on the default route (the local network's, not a VPN's), else
-# any but USB, loopback, containers, bridges and VPNs: only the host, or
-# its VPN's peers, reach those.
-address() {
-    ip -4 route get 1.1.1.1 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }' |
-        grep . ||
-        ip -4 -o addr show scope global |
-        awk '$2 !~ /^(usb|lo|waydroid|veth|docker|br-|tailscale|wg|tun)/ { sub("/.*", "", $4); print $4; exit }'
+# Every address a viewer can open the stream on, "ADDRESS<TAB>INTERFACE",
+# the default route's first: each network the host is on, its VPN
+# (Tailscale) and USB networking included, not loopback, containers or
+# bridges.  With -v hotspot, only the hotspot's (10.42.0.x, NetworkManager's
+# shared network): the server refuses the rest.
+addresses() {
+    def=$(ip -4 route get 1.1.1.1 2>/dev/null |
+              awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }')
+    ip -4 -o addr show scope global |
+        awk -v def="$def" -v hot="$1" '
+            $2 ~ /^(lo|waydroid|veth|docker|br-|virbr|lxc)/ { next }
+            { sub("/.*", "", $4) }
+            hot == "hotspot" && $4 !~ /^10\.42\.0\./ { next }
+            { print ($4 == def ? 0 : 1) "\t" $4 "\t" $2 }' |
+        sort -s -k1,1 | cut -f2-
 }
 
 # Tailscale Funnel: its public name, and what it still needs, one line
@@ -244,8 +252,9 @@ start() {
         missing=$(funnel_missing)
         [ -z "$missing" ] || { printf 'wl-cast: -v wan needs:\n%s\n' "$missing" >&2; exit 1; }
     fi
-    addr=${addr:-$(address)}
-    [ -n "$addr" ] || { echo "wl-cast: no network" >&2; exit 1; }
+    if [ -n "$addr" ]; then addrs=$(printf '%s\tgiven\n' "$addr")
+    else addrs=$(addresses "$who"); fi
+    [ -n "$addrs" ] || { echo "wl-cast: no network${who:+ for -v $who}" >&2; exit 1; }
 
     # The output's size in pixels, even, its long side at most 1920 or the
     # size last chosen on the page.
@@ -283,9 +292,13 @@ start() {
     elif [ "$who" = wan ]; then
         echo "wl-cast: Funnel did not start; local links only" >&2
     fi
-    { [ -n "$public" ] && printf 'https://%s/%s\n' "$public" "${key:+?k=$key}"
-      printf 'http://%s:%s/%s\nhttps://%s:%s/%s\n' "$addr" "$port" "${key:+?k=$key}" \
-             "$addr" "$tls" "${key:+?k=$key}"; } | tee "$links_file"
+    # Every link for these settings, one a line with where it works:
+    # Funnel's public one first, then HTTP and HTTPS on each address.
+    { [ -n "$public" ] && printf 'https://%s/%s\tpublic\n' "$public" "${key:+?k=$key}"
+      printf '%s\n' "$addrs" | while IFS="$(printf '\t')" read -r a dev; do
+          printf 'http://%s:%s/%s\t%s\nhttps://%s:%s/%s\t%s\n' "$a" "$port" "${key:+?k=$key}" "$dev" \
+                 "$a" "$tls" "${key:+?k=$key}" "$dev"
+      done; } | tee "$links_file"
     case "$dims" in dim*) echo "$dims" > "$dim_ok" ;; esac
     return 0
 }
