@@ -176,9 +176,10 @@ function vp8IfNothing(pc, reload) {
   check();
 }
 (async () => {
-  const codecs = RTCRtpReceiver.getCapabilities("video").codecs;
+  // Cromite hides the list (null): H.264 then.
+  const caps = RTCRtpReceiver.getCapabilities("video");
   const codec = new URLSearchParams(location.search).get("codec") || keptCodec()
-    || (codecs.some(c => /h264/i.test(c.mimeType)) ? "h264" : "vp8");
+    || (!caps || caps.codecs.some(c => /h264/i.test(c.mimeType)) ? "h264" : "vp8");
   const k = new URLSearchParams(location.search).get("k");
   const withK = path => k ? path + (path.includes("?") ? "&" : "?") + "k=" + encodeURIComponent(k) : path;
   const offer = await (await fetch(withK("/offer?codec=" + codec))).text();
@@ -341,6 +342,11 @@ function log(o) {
   try { fetch(withKey("/log"), {method: "POST", body: JSON.stringify(o), keepalive: true}); }
   catch (e) {}
 }
+// A script error stops the page silently (no picture, buttons drawn):
+// the host's log says where.  Error text only, never what was typed.
+addEventListener("error", e => log({ev: "js-error", msg: String(e.message), line: e.lineno}));
+addEventListener("unhandledrejection", e =>
+  log({ev: "js-error", msg: String(e.reason && e.reason.message || e.reason)}));
 // Moves (absolute pointer and touch) on the unordered, never-resent "fast"
 // channel: a lost one is outdated by the next.  The rest, reliable.
 let fast = null;
@@ -812,9 +818,12 @@ async function connect() {
     refresh();
   } catch (e) {}
   await status();
-  const codecs = RTCRtpReceiver.getCapabilities("video").codecs;
+  // Cromite hides the list (null, 2026-11-22): H.264 then, and VP8 if no
+  // picture comes (vp8IfNothing).
+  const caps = RTCRtpReceiver.getCapabilities("video");
+  const codecs = caps ? caps.codecs : [];
   const codec = P.get("codec") || keptCodec()
-    || (codecs.some(c => /h264/i.test(c.mimeType)) ? "h264" : "vp8");
+    || (!caps || codecs.some(c => /h264/i.test(c.mimeType)) ? "h264" : "vp8");
   log({ev: "codecs", list: [...new Set(codecs.map(c => c.mimeType))], codec});
   // DIRECT's video comes by WebSocket and WebCodecs, not WebRTC: it needs
   // no H.264 in the browser's WebRTC (Firefox has none without OpenH264,

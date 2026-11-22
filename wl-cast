@@ -71,7 +71,13 @@ running() { [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; }
 usage() { awk 'NR > 2 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"; }
 
 stop() {
-    running && kill -TERM -- "-$(cat "$pid_file")" 2>/dev/null
+    # The server takes a few seconds to end; a start right after found its
+    # port still taken and ended at once (2026-11-22): wait for it, 10 s.
+    if running; then
+        p=$(cat "$pid_file")
+        kill -TERM -- "-$p" 2>/dev/null
+        for _ in $(seq 50); do kill -0 "$p" 2>/dev/null || break; sleep 0.2; done
+    fi
     rm -f "$pid_file" "$links_file"
     [ -f "$funnel" ] && tailscale funnel --https=443 off >/dev/null 2>&1
     rm -f "$funnel"
