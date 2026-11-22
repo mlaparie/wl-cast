@@ -668,7 +668,7 @@ const bu = document.getElementById("bu");
 function showSound() { bu.textContent = v.muted ? "MUTED" : "SOUND"; }
 function sound(on) {
   v.muted = !on;
-  v.play().catch(() => {});
+  v.play().catch(err => log({ev: "play-failed", err: String(err), sound: on}));
   showSound();
 }
 bu.onclick = () => { cfg.sound = v.muted; save(); sound(cfg.sound); };
@@ -677,7 +677,7 @@ let touched = false;
 // (play-failed, black picture, 2026-11-22): the first touch plays it.
 addEventListener("pointerdown", e => {
   if (!touched && e.target !== bu && cfg.sound && v.muted) sound(true);
-  else if (v.paused && v.srcObject) v.play().catch(() => {});
+  else if (v.paused && v.srcObject) v.play().catch(err => log({ev: "play-failed", err: String(err)}));
   touched = true;
 }, {capture: true});
 // The Pro1x's own menus and on-screen keyboard (special keys), on its screen.
@@ -1322,7 +1322,7 @@ showCapture();
 k.addEventListener("keydown", e => {
   if (e.code && e.code !== "Unidentified" && e.key !== "Process") {
     e.preventDefault();
-    send({t: "key", code: e.code, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey});
+    send({t: "key", code: e.code, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey});
   }
 });
 // Keys typed on the page itself go to the Pro1x too, not only in the LKB
@@ -1335,7 +1335,7 @@ addEventListener("keydown", e => {
   if (!e.code || e.code === "Unidentified" || e.key === "Process") return;
   if (/^(Shift|Control|Alt|Meta|OS)(Left|Right)$/.test(e.code) || ["F5", "F11", "F12"].includes(e.code)) return;
   e.preventDefault();
-  send({t: "key", code: e.code, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey});
+  send({t: "key", code: e.code, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey});
 });
 k.addEventListener("input", e => {
   if (k.value) {
@@ -2687,7 +2687,8 @@ class Remote:
              ecodes.EV_REL: [ecodes.REL_WHEEL, ecodes.REL_HWHEEL]},
             name="wl-cast-remote-pointer", vendor=0x1234, product=0x567A)
         keys = sorted({getattr(ecodes, n) for n in CODES.values()}
-                      | {ecodes.KEY_LEFTSHIFT, ecodes.KEY_LEFTCTRL, ecodes.KEY_LEFTALT})
+                      | {ecodes.KEY_LEFTSHIFT, ecodes.KEY_LEFTCTRL, ecodes.KEY_LEFTALT,
+                         ecodes.KEY_LEFTMETA})
         self.keyboard = UInput({ecodes.EV_KEY: keys},
                                name="wl-cast-remote-keyboard",
                                vendor=0x1234, product=0x567B)
@@ -2785,10 +2786,11 @@ class Remote:
                 t.write(e.EV_KEY, e.BTN_TOUCH, 0)
         t.syn()
 
-    def tap(self, key, shift=False, ctrl=False, alt=False):
+    def tap(self, key, shift=False, ctrl=False, alt=False, meta=False):
         e, kb = self.e, self.keyboard
+        # Meta is Super (Mod4) on Linux: the viewer's Meta runs Super bindings.
         mods = [m for m, on in ((e.KEY_LEFTSHIFT, shift), (e.KEY_LEFTCTRL, ctrl),
-                                (e.KEY_LEFTALT, alt)) if on]
+                                (e.KEY_LEFTALT, alt), (e.KEY_LEFTMETA, meta)) if on]
         for m in mods:
             kb.write(e.EV_KEY, m, 1)
         kb.write(e.EV_KEY, key, 1)
@@ -2895,7 +2897,7 @@ class Remote:
                     p.write(e.EV_REL, e.REL_HWHEEL, int(m["h"]))
             elif kind == "key" and m.get("code") in CODES:
                 self.tap(getattr(e, CODES[m["code"]]), m.get("shift"),
-                         m.get("ctrl"), m.get("alt"))
+                         m.get("ctrl"), m.get("alt"), m.get("meta"))
             elif kind == "text":
                 self.text(str(m.get("text", ""))[:200])
             p.syn()
