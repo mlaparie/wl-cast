@@ -118,26 +118,61 @@ def hook(*args, wait=True):
         return None
 
 
+def button_lines():
+    try:
+        with open(os.path.join(CONFIG, "buttons")) as f:
+            return [line.strip() for line in f]
+    except OSError:
+        return []
+
+
 def buttons():
     """The page's own buttons, CONFIG/buttons: one per line, its label and
     the command it runs ("WIN pro1x-menu toggle windowswitcher"); # starts
     a comment.  Read again for every page and every press."""
     found = []
-    try:
-        with open(os.path.join(CONFIG, "buttons")) as f:
-            for line in f:
-                parts = line.strip().split(None, 1)
-                if len(parts) == 2 and not parts[0].startswith("#"):
-                    found.append(tuple(parts))
-    except OSError:
-        pass
+    for line in button_lines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and not parts[0].startswith(("#", "[", "=")):
+            found.append(tuple(parts))
     return found
 
 
+# The page's built-in keyboard buttons: the viewer's keyboard (LKB), and
+# Super, Ctrl and Alt held for the next key.
+BUILTIN = {
+    "lkb": '<button class="x" id="bk">LKB</button>',
+    "super": '<button class="x mod" data-m="meta">SUPER</button>',
+    "ctrl": '<button class="x mod" data-m="ctrl">CTRL</button>',
+    "alt": '<button class="x mod" data-m="alt">ALT</button>',
+}
+
+
 def buttons_html():
+    """The two button bars: bottom left (the default) and top right, beside
+    the page's own.  In CONFIG/buttons, [bottom-left] and [top-right] place
+    the lines after them, and =lkb, =super, =ctrl, =alt the built-in
+    buttons; those not placed go first at the bottom left."""
     import html
-    return "".join(f'<button class="x ub" data-n="{i}">{html.escape(label)}</button>'
-                   for i, (label, _) in enumerate(buttons())).encode()
+    places = {"bottom-left": [], "top-right": []}
+    place, i, seen = "bottom-left", 0, set()
+    for line in button_lines():
+        if line in ("[bottom-left]", "[top-right]"):
+            place = line[1:-1]
+        elif line.startswith("=") and line[1:] in BUILTIN:
+            places[place].append(BUILTIN[line[1:]])
+            seen.add(line[1:])
+        else:
+            parts = line.split(None, 1)
+            if len(parts) == 2 and not parts[0].startswith(("#", "[", "=")):
+                places[place].append(f'<button class="x ub" data-n="{i}">'
+                                     f'{html.escape(parts[0])}</button>')
+                i += 1
+    places["bottom-left"][:0] = [BUILTIN[b] for b in BUILTIN if b not in seen]
+    return ("".join(places["top-right"]).encode(),
+            "".join(places["bottom-left"]).encode())
+
+
 
 PAGE = b"""<!doctype html>
 <meta charset="utf-8">
@@ -211,10 +246,12 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
 #c{display:none}
 #bar{position:fixed;top:4px;right:4px;display:flex;flex-wrap:wrap;justify-content:flex-end;
   gap:3px;opacity:.6;z-index:3;max-width:calc(100vw - 8px)}
-#bar button{font:12px monospace;background:#222;color:#eee;border:1px solid #555;
+#kbar{position:fixed;bottom:4px;left:4px;display:flex;flex-wrap:wrap;
+  gap:3px;opacity:.6;z-index:3;max-width:calc(100vw - 8px)}
+#bar button,#kbar button{font:12px monospace;background:#222;color:#eee;border:1px solid #555;
   border-radius:0;padding:4px 7px}
-#bar.folded .x{display:none}
-#bar button.held{background:#875;color:#fff}
+#bar.folded .x,#bar.folded ~ #kbar .x{display:none}
+#kbar button.held,#bar button.held{background:#875;color:#fff}
 #info{position:fixed;left:6px;top:6px;font:14px monospace;color:#eee;
   background:rgba(0,0,0,.75);padding:8px;display:none;z-index:1}
 #info pre{margin:0;font:inherit}
@@ -246,12 +283,12 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
 </style>
 <video id="v" autoplay muted playsinline></video><canvas id="c"></canvas>
 <div id="bar"><!--BUTTONS-->
-<button class="x" id="bk">LKB</button><button class="x mod" data-m="meta">SUPER</button><button class="x mod" data-m="ctrl">CTRL</button><button class="x mod" data-m="alt">ALT</button><button class="x" id="bu">MUTED</button>
+<button class="x" id="bd">DIM</button><button class="x" id="bu">MUTED</button>
 <button class="x" id="bm">VIDEO</button><button class="x" id="bv">HOST</button><button class="x" id="bt">TOUCH</button>
 <button class="x" id="bp">FREE</button><button class="x" id="bs">SET</button>
 <button class="x" id="bi">INFO</button><button class="x" id="bz">PAUSE</button>
 <button class="x" id="bx">STOP</button><button class="x" id="br">RELOAD</button>
-<button id="bc"></button></div>
+<button id="bc"></button></div><div id="kbar"><!--KBUTTONS--></div>
 <div id="set">
 <div class="h">now</div>
 <label title="the browser's buffer: more is smoother, later">smooth  <input id="ss" type="range" min="0" max="300" step="10"> <span id="ssv"></span> ms</label>
@@ -351,18 +388,20 @@ addEventListener("unhandledrejection", e =>
 // Moves (absolute pointer and touch) on the unordered, never-resent "fast"
 // channel: a lost one is outdated by the next.  The rest, reliable.
 let fast = null;
+// DIM: the host's screen black and back (wl-cast start -d).
+document.getElementById("bd").onclick = () => send({t: "dim"});
 // SUPER, CTRL and ALT on the bar: held for the next key or text typed,
 // for viewers whose keyboard lacks one or whose browser drops it (Android
 // keeps Meta to itself, 2026-11-22).  Tapped again: let go.
 const held = {meta: false, ctrl: false, alt: false};
-for (const b of document.querySelectorAll("#bar .mod")) {
+for (const b of document.querySelectorAll(".mod")) {
   b.addEventListener("mousedown", e => e.preventDefault());   // the LKB stays open
   b.onclick = () => { held[b.dataset.m] = !held[b.dataset.m]; b.classList.toggle("held", held[b.dataset.m]); };
 }
 function withHeld(o) {
   if (o.t !== "key" && o.t !== "text") return o;
   for (const m in held) if (held[m]) { o[m] = true; held[m] = false; }
-  for (const b of document.querySelectorAll("#bar .mod")) b.classList.remove("held");
+  for (const b of document.querySelectorAll(".mod")) b.classList.remove("held");
   return o;
 }
 function send(o) {
@@ -697,7 +736,7 @@ addEventListener("pointerdown", e => {
   touched = true;
 }, {capture: true});
 // The Pro1x's own menus and on-screen keyboard (special keys), on its screen.
-for (const b of document.querySelectorAll("#bar .ub"))
+for (const b of document.querySelectorAll(".ub"))
   b.onclick = () => send({t: "action", name: b.dataset.n});
 // The input mode, shown as in use: TOUCH, then MOUSE, then PAD.
 const MODES = ["touch", "mouse", "pad"];
@@ -1092,7 +1131,7 @@ function mouseMove(e) {
 let triple = false;
 function press(e) {
   if (captured) return;
-  if (e.target.closest && e.target.closest("#bar, #set, #gate, #lockkb")) return;
+  if (e.target.closest && e.target.closest("#bar, #kbar, #set, #gate, #lockkb")) return;
   e.preventDefault();
   if (e.pointerType === "mouse" && cfg.input === "mouse") {
     const n = norm(e);
@@ -1150,7 +1189,7 @@ function press(e) {
 function move(e) {
   if (captured) return;
   if (e.pointerType === "mouse" && cfg.input === "mouse") {
-    if (!(e.target.closest && e.target.closest("#bar, #set, #gate, #lockkb, #info"))) mouseMove(e);
+    if (!(e.target.closest && e.target.closest("#bar, #kbar, #set, #gate, #lockkb, #info"))) mouseMove(e);
     return;
   }
   if (!active.has(e.pointerId)) return;
@@ -1186,7 +1225,7 @@ function move(e) {
 }
 function release(e) {
   if (e.pointerType === "mouse" && cfg.input === "mouse" && !captured && e.type === "pointerup") {
-    if (e.target.closest && e.target.closest("#bar, #set, #gate, #lockkb")) return;
+    if (e.target.closest && e.target.closest("#bar, #kbar, #set, #gate, #lockkb")) return;
     if (e.button === 0) send({t: "up"});
     else send({t: "rbtn", b: MOUSE[e.button] || "left", d: 0});
     return;
@@ -1287,7 +1326,7 @@ document.addEventListener("mousemove", e => {
   if (holdTimer && (holdMoved += Math.abs(e.movementX) + Math.abs(e.movementY)) > 30) holdEnd();
 });
 // The buttons' own: a touch on them makes mouse events too.
-const onButtons = e => e.target.closest && e.target.closest("#bar, #set, #gate, #lockkb");
+const onButtons = e => e.target.closest && e.target.closest("#bar, #kbar, #set, #gate, #lockkb");
 document.addEventListener("mousedown", e => {
   if (!captured || onButtons(e)) return;
   e.preventDefault();
@@ -2860,6 +2899,11 @@ class Remote:
             if kind in ("tdown", "tmove", "tup"):
                 self.touch_event(kind, m.get("id"), m.get("x", 0.0), m.get("y", 0.0))
                 return
+            if kind == "dim":
+                # The host's screen black and back; only with wl-cast start -d.
+                subprocess.Popen(["wl-cast", "dim"], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
             if kind == "action":
                 self.action(m.get("name"))
                 return
@@ -3798,7 +3842,9 @@ class Handler(BaseHTTPRequestHandler):
                      f"({self.headers.get('User-Agent', '?')[:80]})")
         # The page itself asks for the key, so it comes without one.
         if path == "/":
-            self.reply(INTERACTIVE_PAGE.replace(b"<!--BUTTONS-->", buttons_html())
+            top, bottom = buttons_html()
+            self.reply(INTERACTIVE_PAGE.replace(b"<!--BUTTONS-->", top)
+                       .replace(b"<!--KBUTTONS-->", bottom)
                        if remote else PAGE,
                        "text/html; charset=utf-8")
             return
