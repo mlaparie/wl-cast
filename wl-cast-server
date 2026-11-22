@@ -308,7 +308,7 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
 <button id="sy">RESYNC</button></div>
 <div id="note"></div><div id="callmsg">The phone is busy (a call): the stream is paused until it ends.</div><div id="lockmsg">The phone is locked: the picture stays still until it is unlocked.<br>
 Type its password and Enter (it goes to the lock screen), or use a finger on the phone.
-<div id="lockkb"><div id="lockdots"></div></div></div><div id="info"><div id="ih"><span id="clock"></span><button id="ic">&minus;</button></div><div id="ib"><pre id="it"></pre><canvas id="tc" width="200" height="32"></canvas><div id="gl"></div><canvas id="gc" width="300" height="80"></canvas></div></div>
+<div id="lockkb"><div id="lockdots"></div></div></div><div id="info"><div id="ih"><span id="clock"></span><button id="ic">&minus;</button></div><div id="ib"><pre id="it"></pre><canvas id="tc" width="200" height="32"></canvas><div id="gl"></div><canvas id="gc" width="300" height="80" style="width:100%;display:block"></canvas></div></div>
 <div id="gate"><div>The key shown on the phone</div>
 <input id="gk" autocapitalize="off" autocomplete="off" autocorrect="off"
  spellcheck="false" maxlength="16"><button id="go">OK</button><div id="gm"></div></div>
@@ -356,7 +356,7 @@ function vp8IfNothing(pc, reload) {
 }
 const withKey = path =>
   key ? path + (path.includes("?") ? "&" : "?") + "k=" + encodeURIComponent(key) : path;
-const cfg = Object.assign({smooth: 50, av: 0, rate: 6, fps: 30, heat: 70, sound: true, input: "touch", steady: true, adaptive: true, wifi_awake: true,
+const cfg = Object.assign({smooth: 50, av: 0, rate: 6, fps: 30, heat: 70, sound: true, input: "touch", steady: false, adaptive: true, wifi_awake: true,
                            canvas: false, direct: false, folded: false}, store.get("settings", {}));
 if (P.get("mode")) {
   cfg.canvas = P.get("mode") === "canvas";
@@ -519,7 +519,7 @@ function newDecoder() {
       const sent = sentAt.get(f.timestamp);
       if (sent !== undefined) {
         sentAt.delete(f.timestamp);
-        ageSum += Date.now() - sent; ageN++;
+        ageSum += Date.now() + clockOffset - sent; ageN++;
       }
       f.close();
       dframes++;
@@ -996,37 +996,47 @@ function graphPush(s) {
     if (graph[name].length > 120) graph[name].shift();
   }
 }
-// Axes: the time (2 min to now) below, and each curve's top value at the
-// left in its colour, its zero at the bottom line; half-way gridlines.
+// One plot as wide as the panel, all curves together, each to its own
+// scale: its lowest and highest values of the 2 minutes marked and
+// written beside them; the time below.
 function drawGraph() {
-  const W = gc.width, H = gc.height, L = 34, B = 12, h = H - B - 2;
+  gc.width = Math.max(200, gc.clientWidth);
+  const W = gc.width, H = gc.height, B = 11, h = H - B - 8;
   gctx.clearRect(0, 0, W, H);
   gctx.font = "9px monospace"; gctx.textBaseline = "middle";
-  gctx.strokeStyle = "#555"; gctx.lineWidth = 1; gctx.beginPath();
-  for (const f of [0, 0.5, 1]) { gctx.moveTo(L, 1 + h - f * h); gctx.lineTo(W, 1 + h - f * h); }
-  gctx.moveTo(L, 1); gctx.lineTo(L, 1 + h);
-  gctx.stroke();
-  gctx.fillStyle = "#aaa"; gctx.textAlign = "center";
-  [["-2m", L], ["-1m", L + (W - L) / 2], ["now", W - 10]].forEach(([t, x]) => gctx.fillText(t, x, H - 5));
+  gctx.strokeStyle = "#444"; gctx.lineWidth = 1; gctx.beginPath();
+  gctx.moveTo(0, 4 + h); gctx.lineTo(W, 4 + h); gctx.stroke();
+  gctx.fillStyle = "#aaa";
+  gctx.textAlign = "left"; gctx.fillText("-2m", 0, H - 5);
+  gctx.textAlign = "center"; gctx.fillText("-1m", W / 2, H - 5);
+  gctx.textAlign = "right"; gctx.fillText("now", W, H - 5);
   gl.innerHTML = "";
-  GRAPH.forEach(([name, color, label], n) => {
-    const vals = graph[name], top = Math.max(1, ...vals.filter(x => x !== null));
-    gctx.fillStyle = color; gctx.textAlign = "right";
-    gctx.fillText(String(top), L - 3, 5 + n * 10);
+  for (const [name, color, label] of GRAPH) {
+    const vals = graph[name], seen = vals.filter(x => x !== null);
+    const lo = seen.length ? Math.min(...seen) : 0, hi = seen.length ? Math.max(...seen) : 1;
+    const span = Math.max(1, hi - lo);
+    const at = i => [(120 - vals.length + i) * (W - 1) / 119, 4 + h - (vals[i] - lo) * h / span];
     gctx.strokeStyle = color; gctx.lineWidth = 1.5; gctx.beginPath();
     let pen = false;
     vals.forEach((x, i) => {
       if (x === null) { pen = false; return; }
-      const px = L + (120 - vals.length + i) * (W - L) / 119, py = 1 + h - x * h / top;
+      const [px, py] = at(i);
       pen ? gctx.lineTo(px, py) : gctx.moveTo(px, py);
       pen = true;
     });
     gctx.stroke();
-    const span = document.createElement("span");
-    span.style.color = color;
-    span.textContent = label;
-    gl.appendChild(span);
-  });
+    gctx.fillStyle = color;
+    for (const v of seen.length ? [lo, hi] : []) {
+      const i = vals.lastIndexOf(v), [px, py] = at(i);
+      gctx.beginPath(); gctx.arc(px, py, 2.5, 0, 2 * Math.PI); gctx.fill();
+      gctx.textAlign = px > W - 30 ? "right" : "left";
+      gctx.fillText(String(v), px + (px > W - 30 ? -4 : 4), Math.max(5, Math.min(H - B - 2, py)));
+    }
+    const tag = document.createElement("span");
+    tag.style.color = color;
+    tag.textContent = label;
+    gl.appendChild(tag);
+  }
 }
 // INFO moves by its top line and folds by its button, apart from the bar;
 // kept in this browser.
@@ -1077,9 +1087,16 @@ function autofit() {
     .then(() => setTimeout(reloadWhenUp, 1000)).catch(() => {});
 }
 addEventListener("resize", () => setTimeout(autofit, 1500));
+// The phone's clock less this browser's, from /status (its "now" against
+// the middle of the request): frames are stamped by the phone's clock, and
+// an offset between the two went straight into the frame's age.
+let clockOffset = 0;
 async function status() {
   try {
+    const t0 = Date.now();
     phone = await (await fetch(withKey("/status"))).json();
+    const t1 = Date.now();
+    if (phone.now && t1 - t0 < 500) clockOffset = phone.now - (t0 + t1) / 2;
     if (!screenWanted) showScreen();
     document.getElementById("lockmsg").style.display = phone.locked && !phone.held ? "block" : "none";
     document.getElementById("callmsg").style.display = phone.held ? "block" : "none";
@@ -1155,22 +1172,28 @@ setInterval(async () => {
   graphPush(s);
   if (info.style.display === "block") {
     drawGraph();
-    const ev = Object.entries(counts).map(([a, b]) => a + " " + b);
-    const rows = [];
-    for (let i = 0; i < ev.length; i += 3) rows.push("  " + ev.slice(i, i + 3).join("  "));
-    const q = x => x === undefined ? "?" : x;
+    // Missing values as 0 (losses) or left out (the rest), not "?".
+    const z = x => x === undefined || x === null ? 0 : x;
+    const capture = phone.live && phone.live < phone.fps ? phone.live : phone.fps;
+    // DIRECT's total, from the phone's capture to this screen, split into
+    // the encoder, the way here (half the round trip) and the rest
+    // (decoding, waiting to be drawn).
+    const way = s.rtt_ms === undefined ? 0 : Math.round(s.rtt_ms / 2);
+    const rest = s.age_ms === undefined ? undefined : Math.max(0, s.age_ms - z(s.enc_ms) - way);
     it.textContent = [
-      `picture ${s.video} ${(s.codec || "").replace("video/", "")}, ${s.mode}, ${cfg.input}, ${v.muted ? "muted" : "sound"}${captured ? ", captured" : ""}`,
-      `screen  ${phone.screen || "?"}${phone.screen && phone.screen !== "phone" && shapeOff() ? ", not this window's shape: SET size, APPLY" : ""}`,
-      `fps     ${q(s.fps)} shown, phone ${phone.live && phone.live < phone.fps ? phone.live + " (losses)" : phone.fps || "?"}${phone.fps < phone.target ? " (heat; chosen " + phone.target + ")" : ""}${cfg.steady ? " constant" : ""}`,
-      `rate    ${s.kbps} kbit/s of ${phone.mbps || cfg.rate} Mbit/s, ${s.mb} MB`,
-      `loss    ${q(s.lost)} packets, ${q(s.nack)} resent, ${q(s.pli)} keyframes, ${q(s.freezes)} freezes, ${q(s.dropped)} dropped`,
-      `sound   ${q(s.audio_lost)} lost, ${q(s.audio_concealed)}% made up`,
+      `modes   ${s.video} ${(s.codec || "").replace("video/", "")}, ${s.mode}, ${cfg.input}, ${v.muted ? "muted" : "sound"}${captured ? ", captured" : ""}`,
+      `screen  ${phone.screen || ""}${phone.screen && phone.screen !== "phone" && shapeOff() ? ", SET size then APPLY to update" : ""}`,
+      `fps     ${z(s.fps)} client, ${z(capture)} capture${phone.fps < phone.target ? " (heat; chosen " + phone.target + ")" : ""}${cfg.steady ? ", constant" : ""}`,
+      `bitrate ${s.kbps} kbit/s of ${phone.mbps || cfg.rate} Mbit/s set, ${s.mb} MB used`,
       cfg.direct
-        ? `latency ${q(s.rtt_ms)} ms network, encoder ${q(s.enc_ms)} ms, frame ${q(s.age_ms)} ms old when drawn`
-        : `latency ${q(s.rtt_ms)} ms network, buffer ${q(s.buffer_ms)} ms video, ${q(s.audio_buffer_ms)} ms sound`,
-      `phone   ${phone.cpu === undefined ? "?" : phone.cpu + " C"}, Wi-Fi power saving ${phone.wifi_powersave || "?"}; 10 min:`,
-    ].concat(rows.length ? ["events"].concat(rows) : []).join("\\n");
+        ? `loss    ${z(s.skipped)} frames skipped`
+        : `loss    ${z(s.lost)} packets, ${z(s.nack)} resent, ${z(s.pli)} keyframes, ${z(s.freezes)} freezes, ${z(s.dropped)} dropped`,
+      `sound   ${z(s.audio_lost)} lost, ${z(s.audio_concealed)}% made up`,
+      cfg.direct
+        ? `latency ${s.age_ms === undefined ? "" : s.age_ms + " ms to drawn: "}${z(s.enc_ms)} encoder, ${way} network, ${rest === undefined ? 0 : rest} decoding and drawing`
+        : `latency ${z(s.rtt_ms)} ms network round trip, ${z(s.buffer_ms)} ms video buffer, ${z(s.audio_buffer_ms)} ms sound`,
+      `phone   ${phone.cpu === undefined ? "" : phone.cpu + " \\u00b0C"}${phone.wifi_powersave ? ", Wi-Fi power saving " + phone.wifi_powersave : ""}`,
+    ].join("\\n");
   }
   if (++ticks % 10 === 0) log(Object.assign({ev: "stats"}, s));
 }, 1000);
@@ -2110,11 +2133,14 @@ def wifi_hold(on):
 
 
 def wifi_powersave():
-    """on or off, or None without Wi-Fi."""
+    """on or off, or None without Wi-Fi (or iw): the first Wi-Fi interface's,
+    as /sys/class/net lists them."""
     try:
-        out = subprocess.run(["iw", "dev", "wlan0", "get", "power_save"], timeout=5,
+        dev = next(d for d in sorted(os.listdir("/sys/class/net"))
+                   if os.path.isdir(f"/sys/class/net/{d}/wireless"))
+        out = subprocess.run(["iw", "dev", dev, "get", "power_save"], timeout=5,
                              capture_output=True, text=True).stdout
-    except (OSError, subprocess.TimeoutExpired):
+    except (StopIteration, OSError, subprocess.TimeoutExpired):
         return None
     return out.split()[-1] if out.strip() else None
 
@@ -2172,7 +2198,7 @@ class Producer:
         self.adaptive = kept_setting("adaptive", True)
         self.paused = False        # the viewer's PAUSE: no frames encoded
         self.calm = 0              # loss checks since the last loss
-        self.steady = kept_setting("steady", True)
+        self.steady = kept_setting("steady", False)
         self.pushed_at = 0.0
         self.size = size
         self.pipeline = Gst.parse_launch(
@@ -3954,7 +3980,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/check":
             self.reply(b"ok")
         elif path == "/status":
-            self.reply(json.dumps({"cpu": cpu_temperature(),
+            self.reply(json.dumps({"now": int(time.time() * 1000),
+                                   "cpu": cpu_temperature(),
                                    "fps": capture_fps(),
                                    "target": Handler.target,
                                    "mbps": producer.mbps if producer else Handler.mbps,
