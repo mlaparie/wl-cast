@@ -30,8 +30,12 @@
 #   -A APPROVE   off, tap (a notification) or fingerprint, for a new viewer
 #   -v VISIBILITY  who can reach the stream: hotspot (only the devices on
 #                this machine's hotspot) or lan (default: any device that
-#                reaches its address).  wan is the same as lan for now:
-#                from outside, it takes a port your router forwards
+#                reaches its address), or wan: also a public link, by
+#                Tailscale Funnel (https://<machine>.<tailnet>.ts.net/),
+#                for a viewer on no network of yours.  The key and -A
+#                guard it.  It needs Tailscale up, MagicDNS and HTTPS
+#                certificates on, Funnel allowed, and this user as its
+#                operator: wl-cast says what is missing
 #   -w on|off    keep the screen awake while streaming (default on):
 #                through your hook if it does it, else swayidle paused
 #   -d           dim instead of blank: a screen turned off is not
@@ -60,6 +64,8 @@ dim_ok=$rt/wl-cast.dim                  # start -d: "dim", or "dim touch" (-T)
 touch_off=$rt/wl-cast.touch-off         # the touch devices turned off
 key_file=$state/key
 
+funnel=$rt/wl-cast.funnel                # -v wan: Funnel was turned on
+
 running() { [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; }
 
 usage() { awk 'NR > 2 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"; }
@@ -67,6 +73,8 @@ usage() { awk 'NR > 2 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"; }
 stop() {
     running && kill -TERM -- "-$(cat "$pid_file")" 2>/dev/null
     rm -f "$pid_file" "$links_file"
+    [ -f "$funnel" ] && tailscale funnel --https=443 off >/dev/null 2>&1
+    rm -f "$funnel"
     dim off
     rm -f "$dim_ok"
     # swayidle paused by a server that did not end cleanly.
@@ -129,6 +137,26 @@ address() {
         awk '$2 !~ /^(usb|lo|waydroid|veth|docker|br-|tailscale|wg|tun)/ { sub("/.*", "", $4); print $4; exit }'
 }
 
+# Tailscale Funnel: its public name, and what it still needs, one line
+# each with how to set it (nothing when ready).
+ts_json() { tailscale status --json 2>/dev/null; }
+funnel_name() { ts_json | jq -r '.Self.DNSName // empty' | sed 's/\.$//'; }
+funnel_missing() {
+    command -v tailscale >/dev/null || { echo "- Tailscale, installed and logged in (tailscale up)"; return; }
+    j=$(ts_json)
+    [ "$(echo "$j" | jq -r '.BackendState // empty')" = Running ] ||
+        { echo "- Tailscale running and logged in: sudo tailscale up"; return; }
+    [ "$(echo "$j" | jq -r '.CurrentTailnet.MagicDNSEnabled')" = true ] ||
+        echo "- MagicDNS: on, in the Tailscale admin console, DNS page"
+    [ "$(echo "$j" | jq -r '.CertDomains | length')" -gt 0 ] 2>/dev/null ||
+        echo "- HTTPS Certificates: on, same page"
+    [ "$(echo "$j" | jq -r '.Self.CapMap | has("funnel")')" = true ] ||
+        printf '%s\n' "- Funnel allowed (new tailnets have it already): Access controls > JSON editor, in \"nodeAttrs\":" \
+            '    {"target": ["autogroup:member"], "attr": ["funnel"]}'
+    [ "$(tailscale debug prefs 2>/dev/null | jq -r '.OperatorUser // empty')" = "$(id -un)" ] ||
+        echo "- Funnel for this user, once: sudo tailscale set --operator=$(id -un)"
+}
+
 start() {
     addr= port=8081 tls=8443 fps=30 screen=phone approve=off who=lan dims=
     key=$(cat "$key_file" 2>/dev/null)
@@ -151,6 +179,10 @@ start() {
     WL_CAST_PANEL=$(pick_output)
     [ -n "$WL_CAST_PANEL" ] || { echo "wl-cast: no screen chosen" >&2; exit 1; }
     export WL_CAST_PANEL
+    if [ "$who" = wan ]; then
+        missing=$(funnel_missing)
+        [ -z "$missing" ] || { printf 'wl-cast: -v wan needs:\n%s\n' "$missing" >&2; exit 1; }
+    fi
     addr=${addr:-$(address)}
     [ -n "$addr" ] || { echo "wl-cast: no network" >&2; exit 1; }
 
@@ -177,8 +209,21 @@ start() {
     echo $! > "$pid_file"
     sleep 1
     running || { rm -f "$pid_file"; echo "wl-cast: the server did not start" >&2; exit 1; }
-    printf 'http://%s:%s/%s\nhttps://%s:%s/%s\n' "$addr" "$port" "${key:+?k=$key}" \
-           "$addr" "$tls" "${key:+?k=$key}" | tee "$links_file"
+    # Funnel serves the HTTP port as https://<name>/, until the server ends
+    # (by stop, or the watcher if it dies).
+    public=
+    if [ "$who" = wan ] && tailscale funnel --bg "$port" >/dev/null 2>&1; then
+        touch "$funnel"
+        public=$(funnel_name)
+        setsid sh -c 'while kill -0 "$1" 2>/dev/null; do sleep 5; done
+                      [ -f "$2" ] && tailscale funnel --https=443 off; rm -f "$2"' \
+            _ "$(cat "$pid_file")" "$funnel" >/dev/null 2>&1 </dev/null &
+    elif [ "$who" = wan ]; then
+        echo "wl-cast: Funnel did not start; local links only" >&2
+    fi
+    { [ -n "$public" ] && printf 'https://%s/%s\n' "$public" "${key:+?k=$key}"
+      printf 'http://%s:%s/%s\nhttps://%s:%s/%s\n' "$addr" "$port" "${key:+?k=$key}" \
+             "$addr" "$tls" "${key:+?k=$key}"; } | tee "$links_file"
     case "$dims" in dim*) echo "$dims" > "$dim_ok" ;; esac
     return 0
 }
