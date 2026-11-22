@@ -258,6 +258,7 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
 #ih{display:flex;justify-content:space-between;gap:12px;cursor:move;touch-action:none;user-select:none}
 #ic{font:11px monospace;background:#333;color:#eee;border:1px solid #555;padding:0 8px}
 #info.collapsed #ib{display:none}
+#iv{display:none}#info.collapsed #iv{display:inline}#iv span{margin-left:8px}
 #gl{margin-top:6px}#gl span{margin-right:10px}
 #lockmsg,#callmsg{position:fixed;left:50%;top:40%;transform:translate(-50%,-50%);display:none;
   max-width:80%;padding:12px 16px;background:#000c;color:#fff;font:16px sans-serif;
@@ -308,7 +309,7 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
 <button id="sy">RESYNC</button></div>
 <div id="note"></div><div id="callmsg">The phone is busy (a call): the stream is paused until it ends.</div><div id="lockmsg">The phone is locked: the picture stays still until it is unlocked.<br>
 Type its password and Enter (it goes to the lock screen), or use a finger on the phone.
-<div id="lockkb"><div id="lockdots"></div></div></div><div id="info"><div id="ih"><span id="clock"></span><button id="ic">&minus;</button></div><div id="ib"><pre id="it"></pre><canvas id="tc" width="200" height="32"></canvas><div id="gl"></div><canvas id="gc" width="300" height="80" style="width:100%;display:block"></canvas></div></div>
+<div id="lockkb"><div id="lockdots"></div></div></div><div id="info"><div id="ih"><span id="clock"></span><span id="iv"></span><button id="ic">&minus;</button></div><div id="ib"><pre id="it"></pre><canvas id="tc" width="200" height="32"></canvas><div id="gl"></div><canvas id="gc" width="300" height="80" style="width:100%;display:block"></canvas></div></div>
 <div id="gate"><div>The key shown on the phone</div>
 <input id="gk" autocapitalize="off" autocomplete="off" autocorrect="off"
  spellcheck="false" maxlength="16"><button id="go">OK</button><div id="gm"></div></div>
@@ -994,6 +995,16 @@ function graphPush(s) {
   for (const [name, value] of [["fps", s.fps], ["dropped", dropped], ["latency", latency]]) {
     graph[name].push(value === undefined ? null : value);
     if (graph[name].length > 120) graph[name].shift();
+  }
+  // Folded, INFO shows only the curves' values now, in their colours.
+  const iv = document.getElementById("iv");
+  iv.innerHTML = "";
+  for (const [name, color, label] of GRAPH) {
+    const now = graph[name][graph[name].length - 1];
+    const tag = document.createElement("span");
+    tag.style.color = color;
+    tag.textContent = now === null ? "" : now + " " + label.replace("latency ", "");
+    iv.appendChild(tag);
   }
 }
 // One plot as wide as the panel, all curves together, each to its own
