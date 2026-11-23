@@ -3982,6 +3982,106 @@ class DirectViewer:
 TEST = os.environ.get("WL_CAST_TEST", "")
 
 
+class Hls:
+    """The stream as HLS (/live.m3u8), for players that take a URL and play
+    it themselves: a Chromecast (catt cast), VLC, mpv.  The producer's H.264
+    and the sound as AAC, cut into 2 s MPEG-TS segments in a directory of
+    the runtime dir, a keyframe every 2 s.
+    Some seconds behind, as HLS is.  Made on the first request, ended 30 s
+    after the last one (a player asks for the playlist every few seconds).
+    One for all its players."""
+
+    current = None
+    IDLE = 30
+    SEGMENT = re.compile(r"^segment\d{5}\.ts$")
+
+    def __init__(self):
+        self.dir = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "wl-cast-hls")
+        shutil.rmtree(self.dir, ignore_errors=True)
+        os.makedirs(self.dir, mode=0o700)
+        sound = os.environ.get("WL_CAST_SOUND") or "@DEFAULT_MONITOR@"
+        self.pipeline = Gst.parse_launch(
+            f"hlssink2 name=hls target-duration=2 playlist-length=6 max-files=10 "
+            f"location={self.dir}/segment%05d.ts "
+            f"playlist-location={self.dir}/live.m3u8 "
+            "appsrc name=v is-live=true format=time do-timestamp=true "
+            f"caps={Producer.CAPS} ! h264parse config-interval=-1 ! queue ! hls.video "
+            f"pulsesrc device={sound} buffer-time=200000 latency-time=20000 "
+            "slave-method=re-timestamp ! audioconvert ! audioresample ! "
+            "audio/x-raw,rate=48000,channels=2 ! voaacenc bitrate=128000 ! "
+            "aacparse ! queue ! hls.audio")
+        self.src = self.pipeline.get_by_name("v")
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", lambda _b, m: log_line(
+            f"hls error: {m.parse_error()[0].message}"))
+        self.pipeline.set_state(Gst.State.PLAYING)
+        producer.attach(self.src)
+        self.used = time.monotonic()
+        self.timer = GLib.timeout_add_seconds(10, self.idle)
+        # A keyframe at each cut: hlssink2's own requests did not reach the
+        # encoder, and the first segment never ended (2026-11-23).
+        self.keys = GLib.timeout_add(2000, lambda: producer.keyframe() or True)
+        log_line("hls: started")
+
+    @classmethod
+    def get(cls):
+        """The running one, else a new one (from the main loop)."""
+        if cls.current is None:
+            done = threading.Event()
+            def make():
+                try:
+                    cls.current = cls()
+                except GLib.Error as e:
+                    log_line(f"hls: no pipeline ({e})")
+                done.set()
+                return GLib.SOURCE_REMOVE
+            GLib.idle_add(make)
+            done.wait(10)
+        if cls.current:
+            cls.current.used = time.monotonic()
+        return cls.current
+
+    def idle(self):
+        if time.monotonic() - self.used < self.IDLE:
+            return GLib.SOURCE_CONTINUE
+        self.stop()
+        return GLib.SOURCE_REMOVE
+
+    def stop(self):
+        GLib.source_remove(self.keys)
+        producer.detach(self.src)
+        self.pipeline.set_state(Gst.State.NULL)
+        shutil.rmtree(self.dir, ignore_errors=True)
+        Hls.current = None
+        log_line("hls: stopped (no player)")
+
+    def playlist(self, query):
+        """The playlist once its first segment is out (up to 10 s), each
+        segment's line with the link's key."""
+        path = os.path.join(self.dir, "live.m3u8")
+        for _ in range(100):
+            if os.path.exists(path):
+                break
+            time.sleep(0.1)
+        try:
+            with open(path, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            return None
+        return ("\n".join(line if line.startswith("#") or not line else line + query
+                          for line in lines) + "\n").encode()
+
+    def segment(self, name):
+        if not self.SEGMENT.match(name):
+            return None
+        try:
+            with open(os.path.join(self.dir, name), "rb") as f:
+                return f.read()
+        except OSError:
+            return None
+
+
 class DualServer(ThreadingHTTPServer):
     """IPv6 and IPv4 on one socket (a phone's public IPv6 address on a
     hotspot it does not run, for the car's browser: the TESTS); clients'
@@ -4093,6 +4193,9 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             DirectViewer(self.connection).run()
             return
+        if path == "/live.m3u8" or path.startswith("/hls/"):
+            self.hls(path)
+            return
         if path == "/check":
             self.reply(b"ok")
         elif path == "/status":
@@ -4166,6 +4269,40 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(b"no offer", code=500)
         else:
             self.reply(b"not found", code=404)
+
+    def hls(self, path):
+        """Hls's playlist and segments, to any origin (a Chromecast's
+        receiver page fetches them); approval as for a WebRTC viewer."""
+        if not producer:
+            self.reply(b"no hardware encoder: no HLS", code=503)
+            return
+        if approval:
+            st = approval.check(self.client_address[0])
+            if st != "allowed":
+                self.reply(st.encode(), code=202 if st == "waiting" else 403)
+                return
+        hls = Hls.get()
+        if not hls:
+            self.reply(b"no HLS pipeline", code=500)
+            return
+        if path == "/live.m3u8":
+            query = f"?k={urllib.parse.quote(self.key)}" if self.key else ""
+            body, kind = hls.playlist(query), "application/vnd.apple.mpegurl"
+            # Segments are named relative to the playlist: /hls/ in front.
+            if body:
+                body = re.sub(rb"^(segment)", rb"hls/\1", body, flags=re.M)
+        else:
+            body, kind = hls.segment(path[len("/hls/"):]), "video/mp2t"
+        if body is None:
+            self.reply(b"not yet", code=404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self):
         if not self.allowed():
