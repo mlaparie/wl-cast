@@ -267,6 +267,10 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
 #bar.folded .x,#bar.folded ~ #kbar .x{display:none}
 #kbar button.held,#bar button.held{background:#875;color:#fff}
 #bar[data-view] .host,#bar[data-view] ~ #kbar{display:none}
+/* LOW: the bar at the bottom and the keys at the top, out from under
+   something that covers the top of the screen (a car's dashboard). */
+body.low #bar{top:auto;bottom:4px}body.low #kbar{bottom:auto;top:4px}
+body.low #set{top:auto;bottom:64px}
 #info{position:fixed;left:6px;top:40px;font:11px monospace;color:#eee;
   background:rgba(0,0,0,.75);padding:8px;display:none;z-index:1}
 #info pre{margin:0;font:inherit}
@@ -308,7 +312,7 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
 <button class="x" id="bi">INFO</button><button class="x host" id="bv">HOST</button><button class="x" id="bu">MUTED</button><button class="x" id="by">AV SYNC</button>
 <button class="x" id="bm">VIDEO</button><button class="x" id="bt">TOUCH</button><button class="x host" id="bd">DIM</button>
 <button class="x host" id="bp">FREE</button><button class="x" id="bs">SET</button>
-<button class="x" id="bz">PAUSE</button><button class="x host" id="bx">STOP</button><button class="x" id="br">RELOAD</button>
+<button class="x" id="bz">PAUSE</button><button class="x host" id="bx">STOP</button><button class="x" id="br">RELOAD</button><button class="x" id="bw"></button>
 <button id="bc"></button></div><div id="kbar"><!--KBUTTONS--></div>
 <div id="set">
 <div class="h">now</div>
@@ -375,7 +379,7 @@ function vp8IfNothing(pc, reload) {
 const withKey = path =>
   key ? path + (path.includes("?") ? "&" : "?") + "k=" + encodeURIComponent(key) : path;
 const cfg = Object.assign({smooth: 50, av: 0, rate: 6, fps: 30, heat: 70, sound: true, input: "touch", steady: false, sync: false, adaptive: true, wifi_awake: true,
-                           canvas: false, direct: false, folded: false}, store.get("settings", {}));
+                           canvas: false, direct: false, folded: false, low: false}, store.get("settings", {}));
 if (P.get("mode")) {
   cfg.canvas = P.get("mode") === "canvas";
   cfg.direct = P.get("mode") === "direct";
@@ -617,9 +621,12 @@ function tick() {
 document.getElementById("bi").onclick = () => {
   const on = info.style.display !== "block";
   info.style.display = on ? "block" : "none";
-  // Not moved yet: just below the bar, its top line clear of the buttons.
-  if (on && !info.style.top)
-    info.style.top = Math.round(document.getElementById("bar").getBoundingClientRect().bottom + 4) + "px";
+  // Not moved yet: just below the buttons at the top (the bar, or the
+  // keys with the bar at the bottom), its top line clear of them.
+  if (on && !info.style.top) {
+    const above = document.getElementById(cfg.low ? "kbar" : "bar").getBoundingClientRect();
+    info.style.top = Math.round(Math.max(6, above.height ? above.bottom + 4 : 6)) + "px";
+  }
   if (on) { tick(); drawGraph(); }
 };
 document.getElementById("br").onclick = () => location.reload();
@@ -681,6 +688,13 @@ function showFold() {
   bc.textContent = cfg.folded ? "\\u2261" : "\\u00d7";
 }
 bc.onclick = () => { cfg.folded = !cfg.folded; save(); showFold(); };
+// The buttons at the top or the bottom, an arrow to the other side.
+const bw = document.getElementById("bw");
+function showPlace() {
+  document.body.classList.toggle("low", cfg.low);
+  bw.textContent = cfg.low ? "\\u2191 TOP" : "\\u2193 BOTTOM";
+}
+bw.onclick = () => { cfg.low = !cfg.low; save(); showPlace(); };
 const set = document.getElementById("set");
 document.getElementById("bs").onclick = () =>
   set.style.display = set.style.display === "block" ? "none" : "block";
@@ -859,7 +873,7 @@ ad.onchange = () => { cfg.adaptive = ad.checked; save(); log({ev: "setting", nam
 const wp = document.getElementById("wp");
 wp.onchange = () => { cfg.wifi_awake = wp.checked; save(); log({ev: "setting", name: "wifi_awake", value: cfg.wifi_awake}); };
 st.onchange = () => { cfg.steady = st.checked; save(); log({ev: "setting", name: "steady", value: cfg.steady}); };
-function refresh() { showSync(); showHeat(); showFps(); showRate(); showSteady(); showMode(); showInput(); showFold(); showSliders(); showSound(); applyDelay(); }
+function refresh() { showSync(); showHeat(); showFps(); showRate(); showSteady(); showMode(); showInput(); showFold(); showPlace(); showSliders(); showSound(); applyDelay(); }
 refresh();
 
 const pc = new RTCPeerConnection();
@@ -1063,25 +1077,28 @@ function graphPush(s) {
   }
 }
 // One plot as wide as the panel, all curves together, each to its own
-// scale: its lowest and highest values of the 2 minutes marked and
-// written beside them; the time below.
+// scale, its lowest and highest values of the 2 minutes on an axis of its
+// own: fps and dropped on the left, latency and temperature on the right
+// (values written beside the curves were hard to read, author 2026-11-23);
+// the time below.
 function drawGraph() {
   gc.width = Math.max(200, gc.clientWidth);
-  const W = gc.width, H = gc.height, B = 11, h = H - B - 8;
+  const W = gc.width, H = gc.height, B = 11, h = H - B - 8, A = 26;
+  const x0 = 2 * A, x1 = W - 2 * A, w = x1 - x0;
   gctx.clearRect(0, 0, W, H);
   gctx.font = "9px monospace"; gctx.textBaseline = "middle";
   gctx.strokeStyle = "#444"; gctx.lineWidth = 1; gctx.beginPath();
-  gctx.moveTo(0, 4 + h); gctx.lineTo(W, 4 + h); gctx.stroke();
+  gctx.moveTo(x0, 4 + h); gctx.lineTo(x1, 4 + h); gctx.stroke();
   gctx.fillStyle = "#aaa";
-  gctx.textAlign = "left"; gctx.fillText("-2m", 0, H - 5);
-  gctx.textAlign = "center"; gctx.fillText("-1m", W / 2, H - 5);
-  gctx.textAlign = "right"; gctx.fillText("now", W, H - 5);
+  gctx.textAlign = "left"; gctx.fillText("-2m", x0, H - 5);
+  gctx.textAlign = "center"; gctx.fillText("-1m", x0 + w / 2, H - 5);
+  gctx.textAlign = "right"; gctx.fillText("now", x1, H - 5);
   gl.innerHTML = "";
-  for (const [name, color, label] of GRAPH) {
+  GRAPH.forEach(([name, color, label], n) => {
     const vals = graph[name], seen = vals.filter(x => x !== null);
     const lo = seen.length ? Math.min(...seen) : 0, hi = seen.length ? Math.max(...seen) : 1;
     const span = Math.max(1, hi - lo);
-    const at = i => [(120 - vals.length + i) * (W - 1) / 119, 4 + h - (vals[i] - lo) * h / span];
+    const at = i => [x0 + (120 - vals.length + i) * (w - 1) / 119, 4 + h - (vals[i] - lo) * h / span];
     gctx.strokeStyle = color; gctx.lineWidth = 1.5; gctx.beginPath();
     let pen = false;
     vals.forEach((x, i) => {
@@ -1091,18 +1108,24 @@ function drawGraph() {
       pen = true;
     });
     gctx.stroke();
+    // Its axis: the outer column for the first and last, the inner one
+    // for the others; a line on the plot's side, its range written in it.
+    const left = n < 2, inner = n === 1 || n === 2;
+    const edge = left ? (inner ? x0 : A) : (inner ? x1 : W - A);
+    gctx.lineWidth = 1; gctx.beginPath();
+    gctx.moveTo(edge + (left ? -1 : 1), 4); gctx.lineTo(edge + (left ? -1 : 1), 4 + h); gctx.stroke();
     gctx.fillStyle = color;
-    for (const v of seen.length ? [lo, hi] : []) {
-      const i = vals.lastIndexOf(v), [px, py] = at(i);
-      gctx.beginPath(); gctx.arc(px, py, 2.5, 0, 2 * Math.PI); gctx.fill();
-      gctx.textAlign = px > W - 30 ? "right" : "left";
-      gctx.fillText(String(v), px + (px > W - 30 ? -4 : 4), Math.max(5, Math.min(H - B - 2, py)));
+    gctx.textAlign = left ? "right" : "left";
+    const tx = edge + (left ? -4 : 4);
+    if (seen.length) {
+      gctx.fillText(String(hi), tx, 8);
+      gctx.fillText(String(lo), tx, h);
     }
     const tag = document.createElement("span");
     tag.style.color = color;
     tag.textContent = label;
     gl.appendChild(tag);
-  }
+  });
 }
 // INFO moves by its top line and folds by its button, apart from the bar;
 // kept in this browser.
