@@ -10,6 +10,7 @@ I wrote it for my Linux phone (an F(x)tec Pro¹x running Guix and Sway), so I ca
 
 - `wl-cast-capture` copies the screen into GPU buffers, converts them to NV12 and hands them to the hardware encoder as DMA-BUFs. Pixels never go through the CPU, which decreases latency and increases performance.
 - `wl-cast-server` serves the page and streams the video and the sound over WebRTC. Touches and keys come back over a data channel and are played on virtual input devices.
+- The same stream is also served as HLS at `/live.m3u8` (with `?k=KEY` when there is a key), for players that take a URL and play it themselves, like a Chromecast (`catt cast http://ADDRESS:8081/live.m3u8?k=KEY`), VLC or mpv. It is some seconds behind, so it suits watching a video, not typing. `wl-cast start -l 1280 -f 24 -b 2` lowers its size, rate and bit rate if it stalls or the phone gets hot.
 - `wl-cast` starts and stops it: `wl-cast start` asks which screen to stream if you have several and prints its links (each address it can be reached on, with the interface), `wl-cast stop` ends it.
 
 Two helpers come with it. `wl-cast-screen` streams a screen made at the size of the viewer's window instead of your own (`wl-cast start -s client`), so the picture fills a car's display for instance, and it follows when the window is resized. `wl-cast-cert` gets a real certificate for a domain of yours, for browsers that refuse local addresses and self-signed certificates, like some cars' browsers ([HTTPS.md](HTTPS.md)).
