@@ -28,6 +28,10 @@
 #   -k KEY       the key the link carries; -k '' for none.  Default: a random
 #                one, kept between runs so that a bookmark keeps working
 #   -f FPS       frame rate (30)
+#   -l PIXELS    the picture's long side at most (default: the size last
+#                chosen on the page, else 1920)
+#   -b MBPS      the encoder's bit rate in Mbit/s (default: the rate last
+#                chosen on the page)
 #   -s SCREEN    what the viewer sees: host (this screen as it is),
 #                client (a screen made at the size of the viewer's
 #                window, which this screen's windows move to) or multi (a
@@ -243,10 +247,12 @@ start() {
         echo "$key" > "$key_file"
     fi
     view=
-    while getopts o:a:p:t:k:f:s:A:v:w:dTnh o; do
+    long=$(cat "${XDG_STATE_HOME:-$HOME/.local/state}/wl-cast-size" 2>/dev/null)
+    while getopts o:a:p:t:k:f:l:b:s:A:v:w:dTnh o; do
         case $o in
             o) WL_CAST_PANEL=$OPTARG ;; a) addr=$OPTARG ;; p) port=$OPTARG ;; t) tls=$OPTARG ;;
-            k) key=$OPTARG ;; f) fps=$OPTARG ;;
+            k) key=$OPTARG ;; f) fps=$OPTARG ;; l) long=$OPTARG ;;
+            b) export WL_CAST_MBPS=$OPTARG ;;
             s) case $OPTARG in host) screen=phone ;; multi) screen=multi-monitor ;; *) screen=$OPTARG ;; esac ;;
             A) approve=$OPTARG ;; v) who=$OPTARG ;;
             w) [ "$OPTARG" = off ] && export WL_CAST_AWAKE=0 ;;
@@ -267,8 +273,7 @@ start() {
     [ -n "$addrs" ] || { echo "wl-cast: no network${who:+ for -v $who}" >&2; exit 1; }
 
     # The output's size in pixels, even, its long side at most 1920 or the
-    # size last chosen on the page.
-    long=$(cat "${XDG_STATE_HOME:-$HOME/.local/state}/wl-cast-size" 2>/dev/null)
+    # size last chosen on the page (or -l).
     read -r turn w h < <(swaymsg -t get_outputs -r | jq -r --arg o "$WL_CAST_PANEL" '
         [.[] | select(.name == $o)][0]
         | "\(.transform) \(.rect.width * .scale) \(.rect.height * .scale)"')
