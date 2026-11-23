@@ -3985,14 +3985,18 @@ TEST = os.environ.get("WL_CAST_TEST", "")
 class Hls:
     """The stream as HLS (/live.m3u8), for players that take a URL and play
     it themselves: a Chromecast (catt cast), VLC, mpv.  The producer's H.264
-    and the sound as AAC, cut into 2 s MPEG-TS segments in a directory of
-    the runtime dir, a keyframe every 2 s.
+    and the sound as AAC, cut into 4 s MPEG-TS segments in a directory of
+    the runtime dir, a keyframe at each cut.
     Some seconds behind, as HLS is.  Made on the first request, ended 30 s
     after the last one (a player asks for the playlist every few seconds).
     One for all its players."""
 
     current = None
     IDLE = 30
+    # 2 s segments kept a Chromecast buffering, picture frozen for seconds
+    # (author, 2026-11-23); each cut is a keyframe, the stream's largest
+    # frames.
+    CUT = 4
     SEGMENT = re.compile(r"^segment\d{5}\.ts$")
 
     def __init__(self):
@@ -4001,7 +4005,7 @@ class Hls:
         os.makedirs(self.dir, mode=0o700)
         sound = os.environ.get("WL_CAST_SOUND") or "@DEFAULT_MONITOR@"
         self.pipeline = Gst.parse_launch(
-            f"hlssink2 name=hls target-duration=2 playlist-length=6 max-files=10 "
+            f"hlssink2 name=hls target-duration={self.CUT} playlist-length=6 max-files=10 "
             f"location={self.dir}/segment%05d.ts "
             f"playlist-location={self.dir}/live.m3u8 "
             "appsrc name=v is-live=true format=time do-timestamp=true "
@@ -4021,7 +4025,8 @@ class Hls:
         self.timer = GLib.timeout_add_seconds(10, self.idle)
         # A keyframe at each cut: hlssink2's own requests did not reach the
         # encoder, and the first segment never ended (2026-11-23).
-        self.keys = GLib.timeout_add(2000, lambda: producer.keyframe() or True)
+        self.keys = GLib.timeout_add(self.CUT * 1000, lambda: producer.keyframe() or True)
+        self.sent = {}             # client: segments, bytes since the last report
         log_line("hls: started")
 
     @classmethod
@@ -4043,6 +4048,11 @@ class Hls:
         return cls.current
 
     def idle(self):
+        # What each player fetched, every 10 s: a player that falls behind
+        # fetches fewer segments than 10 s of them.
+        sent, self.sent = self.sent, {}
+        for who, (n, size) in sent.items():
+            log_line(f"hls: {who} got {n} segments, {size / 125000:.1f} Mbit in 10 s")
         if time.monotonic() - self.used < self.IDLE:
             return GLib.SOURCE_CONTINUE
         self.stop()
@@ -4072,14 +4082,17 @@ class Hls:
         return ("\n".join(line if line.startswith("#") or not line else line + query
                           for line in lines) + "\n").encode()
 
-    def segment(self, name):
+    def segment(self, name, who):
         if not self.SEGMENT.match(name):
             return None
         try:
             with open(os.path.join(self.dir, name), "rb") as f:
-                return f.read()
+                data = f.read()
         except OSError:
             return None
+        n, size = self.sent.get(who, (0, 0))
+        self.sent[who] = (n + 1, size + len(data))
+        return data
 
 
 class DualServer(ThreadingHTTPServer):
@@ -4292,7 +4305,7 @@ class Handler(BaseHTTPRequestHandler):
             if body:
                 body = re.sub(rb"^(segment)", rb"hls/\1", body, flags=re.M)
         else:
-            body, kind = hls.segment(path[len("/hls/"):]), "video/mp2t"
+            body, kind = hls.segment(path[len("/hls/"):], self.client_address[0]), "video/mp2t"
         if body is None:
             self.reply(b"not yet", code=404)
             return
@@ -4542,9 +4555,9 @@ def main():
         log_line("no screen of its own without the ScreenCast portal")
         screen.stop()
         screen = None
-    # Set by reexec, else the rate the page kept on the phone.
+    # Set by reexec or wl-cast -b, else the rate the page kept on the phone.
     try:
-        Handler.mbps = float(os.environ.pop("WL_CAST_MBPS"))
+        Handler.mbps = min(20.0, max(0.5, float(os.environ.pop("WL_CAST_MBPS"))))
     except (KeyError, ValueError):
         try:
             Handler.mbps = min(20.0, max(0.5, float(kept_setting("rate", Handler.mbps))))
