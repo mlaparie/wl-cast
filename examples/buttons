@@ -2,11 +2,12 @@
 # One per line: a label, then the command it runs on the host.  The command
 # runs through Sway, on the stream's screen, with WL_CAST_OUTPUT (that
 # screen) and WL_CAST_PANEL (the one streamed) set.  Changes show at the
-# page's next reload.  Three fingers on the page fold or show the buttons.
+# page's next reload.  Three fingers tapped on the page fold or show the
+# buttons; held, they show them on a wheel.
 #
-# They sit at the bottom left, after the built-in CTRL, SUPER, ALT and LKB.
+# They sit at the bottom left, after the built-in CTRL, SUPER, ALT, LKB and UP.
 # A line [top-right] puts the buttons after it at the top right, beside the
-# page's own, and [bottom-left] back; =lkb, =super, =ctrl and =alt place
+# page's own, and [bottom-left] back; =lkb, =up, =super, =ctrl and =alt place
 # the built-in ones where they appear.
 #
 # The commands below are placeholders: put your own launcher, window
