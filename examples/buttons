@@ -5,9 +5,9 @@
 # page's next reload.  Three fingers tapped on the page fold or show the
 # buttons; held, they show them on a wheel.
 #
-# They sit at the bottom left, after the built-in CTRL, SUPER, ALT, LKB and UP.
+# They sit at the bottom left, after the built-in CTRL, SUPER, ALT, LKB and the arrow.
 # A line [top-right] puts the buttons after it at the top right, beside the
-# page's own, and [bottom-left] back; =lkb, =up, =super, =ctrl and =alt place
+# page's own, and [bottom-left] back; =lkb, =place, =super, =ctrl and =alt place
 # the built-in ones where they appear.
 #
 # The commands below are placeholders: put your own launcher, window

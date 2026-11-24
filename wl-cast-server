@@ -152,21 +152,22 @@ def buttons():
     return found
 
 
-# The page's built-in keyboard buttons: the viewer's keyboard (LKB), the Up
-# arrow (UP), and Super, Ctrl and Alt held for the next key.
+# The page's built-in buttons on the keys' row: the viewer's keyboard (LKB),
+# the arrow that moves both rows to the other edge (as the bar's own), and
+# Super, Ctrl and Alt held for the next key.
 BUILTIN = {
     "ctrl": '<button class="x mod" data-m="ctrl">CTRL</button>',
     "super": '<button class="x mod" data-m="meta">SUPER</button>',
     "alt": '<button class="x mod" data-m="alt">ALT</button>',
     "lkb": '<button class="x" id="bk">LKB</button>',
-    "up": '<button class="x" id="bup">UP</button>',
+    "place": '<button class="x" id="bw2"></button>',
 }
 
 
 def buttons_html():
     """The two button bars: bottom left (the default) and top right, beside
     the page's own.  In CONFIG/buttons, [bottom-left] and [top-right] place
-    the lines after them, and =lkb, =up, =super, =ctrl, =alt the built-in
+    the lines after them, and =lkb, =place, =super, =ctrl, =alt the built-in
     buttons; those not placed go first at the bottom left."""
     import html
     places = {"bottom-left": [], "top-right": []}
@@ -446,12 +447,6 @@ for (const b of document.querySelectorAll(".mod")) {
   b.addEventListener("mousedown", e => e.preventDefault());   // the LKB stays open
   b.onclick = () => { held[b.dataset.m] = !held[b.dataset.m]; b.classList.toggle("held", held[b.dataset.m]); };
 }
-// UP: the Up arrow, for a viewer's keyboard without arrows.
-const bup = document.getElementById("bup");
-if (bup) {
-  bup.addEventListener("mousedown", e => e.preventDefault());   // the LKB stays open
-  bup.onclick = () => send({t: "key", code: "ArrowUp", shift: false, ctrl: false, alt: false});
-}
 function withHeld(o) {
   if (o.t !== "key" && o.t !== "text") return o;
   for (const m in held) if (held[m]) { o[m] = true; held[m] = false; }
@@ -722,8 +717,15 @@ const bw = document.getElementById("bw");
 function showPlace() {
   document.body.classList.toggle("low", cfg.low);
   bw.textContent = cfg.low ? "\\u2191 TOP" : "\\u2193 BOTTOM";
+  // The keys' row has its own, for the other edge (author, 2026-11-25).
+  if (bw2) bw2.textContent = cfg.low ? "\\u2193 BOTTOM" : "\\u2191 TOP";
 }
 bw.onclick = () => { cfg.low = !cfg.low; save(); showPlace(); };
+const bw2 = document.getElementById("bw2");
+if (bw2) {
+  bw2.addEventListener("mousedown", e => e.preventDefault());   // the LKB stays open
+  bw2.onclick = bw.onclick;
+}
 const set = document.getElementById("set");
 document.getElementById("bs").onclick = () =>
   set.style.display = set.style.display === "block" ? "none" : "block";
