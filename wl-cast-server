@@ -514,8 +514,24 @@ const picH = () => cfg.direct ? c.height : v.videoHeight;
 const directOk = () => "VideoDecoder" in window &&
   (() => { try { return !sessionStorage.getItem("nodirect"); } catch (x) { return true; } })();
 
+// The gaps between frames shown, in ms (VIDEO and CANVAS: the video
+// element's frames as the browser presents them; DIRECT: present()), for
+// INFO and the phone's log: even gaps are smooth motion, whatever the fps.
+const gaps = [];
+let lastShown = 0;
+function shownAt(t) {
+  if (lastShown) { gaps.push(t - lastShown); if (gaps.length > 300) gaps.shift(); }
+  lastShown = t;
+}
+function gapStats() {
+  if (gaps.length < 10) return null;
+  const g = gaps.slice().sort((a, b) => a - b), q = f => Math.round(g[Math.floor(g.length * f)]);
+  const med = q(0.5);
+  return {p50: med, p90: q(0.9), p99: q(0.99), long: g.filter(x => x > med * 1.5).length, n: g.length};
+}
 // The picture: in the video element, or drawn on a canvas from it.
-function draw() {
+function draw(now, meta) {
+  if (meta && !cfg.direct) shownAt(meta.expectedDisplayTime || now);
   if (cfg.canvas && !cfg.direct && v.videoWidth) {
     if (c.width !== v.videoWidth) { c.width = v.videoWidth; c.height = v.videoHeight; }
     ctx.drawImage(v, 0, 0);
@@ -578,6 +594,7 @@ function present() {
       c.width = fr.displayWidth; c.height = fr.displayHeight;
     }
     ctx.drawImage(fr, 0, 0);
+    shownAt(performance.now());
     const sent = sentAt.get(fr.timestamp);
     if (sent !== undefined) {
       sentAt.delete(fr.timestamp);
@@ -1327,6 +1344,8 @@ setInterval(async () => {
     if (ageN) { s.age_ms = Math.round(ageSum / ageN); ageSum = ageN = 0; }
     if (encN) { s.enc_ms = Math.round(encSum / encN); encSum = encN = 0; }
   }
+  const gs = gapStats();
+  if (gs) s.gaps = gs;
   let bytes = 0, rate = 0;
   let pair = null; const cands = {};
   (await pc.getStats()).forEach(r => {
@@ -1392,6 +1411,7 @@ setInterval(async () => {
         ? `loss    ${z(s.skipped)} frames skipped, ${z(s.late)} late; paced ${z(s.pace_ms)} ms behind the quickest`
         : `loss    ${z(s.lost)} packets, ${z(s.nack)} resent, ${z(s.pli)} keyframes, ${z(s.freezes)} freezes, ${z(s.dropped)} dropped`,
       `sound   ${z(s.audio_lost)} lost, ${z(s.audio_concealed)}% made up`,
+      ...(s.gaps ? [`gaps    ${s.gaps.p50} ms median, ${s.gaps.p90} at 90%, ${s.gaps.p99} at 99%; ${s.gaps.long} of ${s.gaps.n} over 1.5x`] : []),
       cfg.direct
         ? `latency ${s.age_ms === undefined ? "" : s.age_ms + " ms to drawn: "}${z(s.enc_ms)} encoder, ${way} network, ${rest === undefined ? 0 : rest} decoding and drawing`
         : `latency ${z(s.rtt_ms)} ms network round trip, ${z(s.buffer_ms)} ms video buffer, ${z(s.audio_buffer_ms)} ms sound`,
@@ -2939,6 +2959,7 @@ class Screencast(Producer):
         self.counts = {"encoded": 0, "held": 0}
         self.bytes = 0
         self.headers = b""          # SPS and PPS, for later keyframes
+        self.last_captured, self.cap_gaps = 0, []
         self.holding = False
         self.proc = subprocess.Popen(
             [SCREENCAST, "-o", output, "-s", size.split("@")[0], "-r", str(self.fps),
@@ -2980,6 +3001,10 @@ class Screencast(Producer):
             if len(head) < self.HEAD.size:
                 break
             magic, n, key, captured, done = self.HEAD.unpack(head)
+            # The gaps between frames captured, for the report.
+            if self.last_captured:
+                self.cap_gaps.append((captured - self.last_captured) / 1000)
+            self.last_captured = captured
             data = out.read(n)
             if magic != b"PXSC" or len(data) < n:
                 break
@@ -3061,6 +3086,13 @@ class Screencast(Producer):
             self.enc_median = enc[len(enc) // 2]
             log_line(f"delay ms, Sway's frame to encoded (median/worst): "
                      f"{enc[len(enc) // 2]}/{enc[-1]}")
+        g = sorted(self.cap_gaps)
+        self.cap_gaps = []
+        if len(g) >= 10:
+            med = g[len(g) // 2]
+            log_line(f"capture gaps ms: median {med:.1f}, 90% {g[len(g) * 9 // 10]:.1f}, "
+                     f"99% {g[len(g) * 99 // 100]:.1f}, worst {g[-1]:.1f}; "
+                     f"{sum(x > med * 1.5 for x in g)} of {len(g)} over 1.5x")
         return GLib.SOURCE_CONTINUE
 
     def stop(self):
