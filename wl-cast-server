@@ -2403,6 +2403,7 @@ class Producer:
         self.portal, self.mbps = portal, mbps
         self.lock = threading.Lock()
         self.viewers = {}          # appsrc: still waiting for a keyframe
+        self.viewer_pts = {}       # appsrc: the last timestamp given it
         self.direct = {}           # send(data, key): still waiting, as above
         self.asked_key = 0.0
         self.last = None
@@ -2739,9 +2740,23 @@ class Producer:
             for send in direct:
                 self.direct[send] = False
         for src in viewers:
-            # Timed by each viewer's pipeline as it arrives (do-timestamp).
+            # Timed as it entered the encoder (author, 2026-11-25: timed as
+            # it came out, the encoder's uneven time per frame showed in
+            # the browser as uneven motion).  The pipelines share the
+            # system clock: the encoder's running time in this viewer's.
+            # Before its last, or out by over a second: timed as it
+            # arrives (do-timestamp), as before.
             copy = buf.copy()
-            copy.pts = copy.dts = copy.duration = Gst.CLOCK_TIME_NONE
+            pts = Gst.CLOCK_TIME_NONE
+            if buf.pts != Gst.CLOCK_TIME_NONE:
+                t = self.pipeline.get_base_time() + buf.pts - src.get_base_time()
+                now = src.get_clock().get_time() - src.get_base_time() if src.get_clock() else None
+                last = self.viewer_pts.get(src, -1)
+                if now is not None and t > last and abs(t - now) < Gst.SECOND:
+                    pts = t
+                    self.viewer_pts[src] = t
+            copy.pts = copy.dts = pts
+            copy.duration = Gst.CLOCK_TIME_NONE
             src.emit("push-buffer", copy)
         # The encoder's delay: from this frame's way in (by its timestamp).
         with self.lock:
@@ -2813,6 +2828,7 @@ class Producer:
     def detach(self, src):
         with self.lock:
             self.viewers.pop(src, None)
+            self.viewer_pts.pop(src, None)
 
     def stop(self):
         if self.keyframes:
