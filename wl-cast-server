@@ -553,36 +553,60 @@ document.getElementById("bm").onclick = async () => {
 
 // DIRECT: the encoder's access units from the phone in the "video" data
 // channel, in chunks (frame number, index, count, keyframe flag), decoded
-// by WebCodecs and drawn as each comes out, without the browser's playout
-// buffer.  Behind (the decoder holding more than two), frames are skipped
+// by WebCodecs, and drawn at the phone's own pace: each frame when it
+// entered the phone's encoder, plus a delay that 95% of the frames
+// arrive within, plus SMOOTH (author, 2026-11-25: drawn as they came, over
+// a network with jitter, a 30 fps video at 30 fps looked choppy).  The
+// delay is measured, so the two clocks need not agree.  Behind (the decoder holding more than two), frames are skipped
 // to the next keyframe, asked for at once: the newest frame wins.
 let decoder = null, dframes = 0, dskipped = 0, derrors = 0, needKey = true;
+// Frames decoded and waiting for their time; arrival less entry, last 3 s.
+const queued = [], transit = [];
+let base = 0, late = 0;
+function present() {
+  const now = Date.now();
+  let f = null;
+  while (queued.length && queued[0].due <= now) {
+    if (f) { f.frame.close(); dskipped++; }
+    f = queued.shift();
+  }
+  if (f) {
+    const fr = f.frame;
+    if (c.width !== fr.displayWidth || c.height !== fr.displayHeight) {
+      c.width = fr.displayWidth; c.height = fr.displayHeight;
+    }
+    ctx.drawImage(fr, 0, 0);
+    const sent = sentAt.get(fr.timestamp);
+    if (sent !== undefined) {
+      sentAt.delete(fr.timestamp);
+      ageSum += Date.now() + clockOffset - sent; ageN++;
+    }
+    fr.close();
+    dframes++;
+  }
+  requestAnimationFrame(present);
+}
+requestAnimationFrame(present);
 let askedKey = 0, dkeys = 0, behindSince = 0;
 // How old each frame is when drawn: from leaving the phone's encoder
 // (its clock and this one both set by NTP), and the encoder's own delay.
-const sentAt = new Map();
+const sentAt = new Map(), entryAt = new Map();
 let ageSum = 0, ageN = 0, encSum = 0, encN = 0;
 const parts = {seq: -1, got: 0, n: 0, key: false, chunks: []};
 function newDecoder() {
   if (decoder) try { decoder.close(); } catch (e) {}
   decoder = new VideoDecoder({
     output: f => {
-      // AV SYNC may hold the picture back to its buffer (syncHold).
-      const draw = () => {
-        if (c.width !== f.displayWidth || c.height !== f.displayHeight) {
-          c.width = f.displayWidth; c.height = f.displayHeight;
-        }
-        ctx.drawImage(f, 0, 0);
-        const sent = sentAt.get(f.timestamp);
-        if (sent !== undefined) {
-          sentAt.delete(f.timestamp);
-          ageSum += Date.now() + clockOffset - sent; ageN++;
-        }
-        f.close();
-        dframes++;
-      };
+      // Its time: when it entered the phone's encoder, in this clock's
+      // terms through the measured delay; AV SYNC may add (syncHold).
+      const entry = entryAt.get(f.timestamp);
+      entryAt.delete(f.timestamp);
       const hold = cfg.sync && cfg.direct ? syncHold : 0;
-      hold > 0 ? setTimeout(draw, hold) : draw();
+      const due = entry === undefined ? Date.now() : entry + base + cfg.smooth + hold;
+      if (due < Date.now() - 50) late++;
+      queued.push({frame: f, due});
+      // A hidden tab draws nothing: the oldest go.
+      while (queued.length > 12) { queued.shift().frame.close(); dskipped++; }
     },
     error: e => {
       log({ev: "decoder-error", err: String(e)});
@@ -612,7 +636,7 @@ function onVideo(m) {
   const sent = Number(d.getBigUint64(9)), enc = d.getUint16(17);
   if (seq !== parts.seq) {
     parts.seq = seq; parts.got = 0; parts.n = n; parts.key = key; parts.chunks = new Array(n);
-    parts.sent = sent; encSum += enc; encN++;
+    parts.sent = sent; parts.enc = enc; encSum += enc; encN++;
   }
   parts.chunks[i] = new Uint8Array(m.data, 19);
   if (++parts.got < parts.n) return;
@@ -638,6 +662,15 @@ function onVideo(m) {
   const ts = Math.round(performance.now() * 1000);
   sentAt.set(ts, parts.sent);
   if (sentAt.size > 120) sentAt.delete(sentAt.keys().next().value);
+  // When it entered the encoder (the phone's clock), and how long after
+  // that it came: the delay 95% of the last 3 s came within.
+  const entry = parts.sent - parts.enc;
+  transit.push(Date.now() - entry);
+  if (transit.length > 90) transit.shift();
+  const sorted = transit.slice().sort((a, b) => a - b);
+  base = sorted[Math.floor(sorted.length * 0.95)];
+  entryAt.set(ts, entry);
+  if (entryAt.size > 120) entryAt.delete(entryAt.keys().next().value);
   decoder.decode(new EncodedVideoChunk({type: parts.key ? "key" : "delta", timestamp: ts, data}));
 }
 // INFO: what the browser reports, and this computer's clock to the
@@ -1261,6 +1294,8 @@ setInterval(async () => {
     s.skipped = dskipped;
     s.keys = dkeys;
     s.decode_queue = decoder ? decoder.decodeQueueSize : null;
+    s.late = late;
+    s.pace_ms = Math.max(0, Math.round(transit.length ? base - Math.min(...transit) : 0)) + cfg.smooth;
     if (ageN) { s.age_ms = Math.round(ageSum / ageN); ageSum = ageN = 0; }
     if (encN) { s.enc_ms = Math.round(encSum / encN); encSum = encN = 0; }
   }
@@ -1326,7 +1361,7 @@ setInterval(async () => {
       `fps     ${z(s.fps)} client, ${z(capture)} capture${phone.fps < phone.target ? " (heat; chosen " + phone.target + ")" : ""}${cfg.steady ? ", constant" : ""}`,
       `bitrate ${s.kbps} kbit/s of ${phone.mbps || cfg.rate} Mbit/s set, ${s.mb} MB used`,
       cfg.direct
-        ? `loss    ${z(s.skipped)} frames skipped`
+        ? `loss    ${z(s.skipped)} frames skipped, ${z(s.late)} late; paced ${z(s.pace_ms)} ms behind the quickest`
         : `loss    ${z(s.lost)} packets, ${z(s.nack)} resent, ${z(s.pli)} keyframes, ${z(s.freezes)} freezes, ${z(s.dropped)} dropped`,
       `sound   ${z(s.audio_lost)} lost, ${z(s.audio_concealed)}% made up`,
       cfg.direct
@@ -2463,8 +2498,11 @@ class Producer:
 
     def frame(self, sink):
         """A new frame of the screen: to the encoder at once, unless one
-        went less than 0.9 frame ago (then the clock takes the latest at
-        its next tick).  Steady too: waiting for the tick cost up to a
+        went less than 0.6 frame ago (then the clock takes the latest at
+        its next tick).  At 0.9, a 30 fps video whose frames came a little
+        early was cut to every other frame now and then, and its motion
+        jumped (author, 2026-11-25); at 0.6 a faster screen is still held
+        to the chosen rate.  Steady too: waiting for the tick cost up to a
         frame of delay (33 ms at 30 fps); the clock only repeats the last
         frame when the screen sends none."""
         sample = sink.emit("pull-sample")
@@ -2493,7 +2531,7 @@ class Producer:
                 self.bench["gpu"].append(
                     (clock.get_time() - self.capture.get_base_time() - self.last.pts) / 1e6)
         if (not self.paused
-                and time.monotonic() - self.pushed_at >= 0.9 / self.rate()):
+                and time.monotonic() - self.pushed_at >= 0.6 / self.rate()):
             if self.held():
                 self.counts["held"] += 1
             else:
