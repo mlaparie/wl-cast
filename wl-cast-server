@@ -338,6 +338,7 @@ body.low #set{top:auto;bottom:64px}
 <label title="above it the phone lowers the fps by 5, and raises it 5 C cooler">heat    <input id="sh" type="range" min="0" max="85" step="5"> <span id="shv"></span></label>
 <label title="fewer frames while the viewer loses packets, back up once it stops">adaptive <input id="ad" type="checkbox"></label>
 <label title="power saving delays and loses what the phone sends; off costs battery">wifi    <input id="wp" type="checkbox"> no power saving while streaming</label>
+<label title="HEVC: better picture for the bit rate, where the browser plays it; changing it restarts the picture">codec   <select id="cd"><option value="h264">H.264</option><option value="hevc">HEVC</option></select></label>
 <div class="h">on apply (restarts the picture)</div>
 <label>rate    <input id="sb" type="range" min="1" max="16" step="1"> <span id="sbv"></span> Mbit/s</label>
 <label title="constant fps needs one the phone keeps up: 20 at 1920, 25 at 1600">fps     <input id="sf" type="range" min="10" max="60" step="5"> <span id="sfv"></span></label>
@@ -559,6 +560,8 @@ document.getElementById("bm").onclick = async () => {
 // delay is measured, so the two clocks need not agree.  Behind (the decoder holding more than two), frames are skipped
 // to the next keyframe, asked for at once: the newest frame wins.
 let decoder = null, dframes = 0, dskipped = 0, derrors = 0, needKey = true;
+// HEVC as the phone's encoder makes it: Main, level 4.
+const HEVC = "hvc1.1.6.L120.B0";
 // Frames decoded and waiting for their time; arrival less entry, last 3 s.
 const queued = [], transit = [];
 let base = 0, late = 0;
@@ -624,7 +627,7 @@ function newDecoder() {
   // Its colours: BT.709, limited range, as wl-cast-capture and the GPU
   // stage write them; the stream does not say (Venus writes no colour
   // information), and Chromium's guess looked wrong (author, 2026-11-20).
-  decoder.configure({codec: "avc1.42c028", optimizeForLatency: true,
+  decoder.configure({codec: phone.codec === "hevc" ? HEVC : "avc1.42c028", optimizeForLatency: true,
                      colorSpace: {primaries: "bt709", transfer: "bt709",
                                   matrix: "bt709", fullRange: false}});
 }
@@ -955,7 +958,15 @@ ad.onchange = () => { cfg.adaptive = ad.checked; save(); log({ev: "setting", nam
 const wp = document.getElementById("wp");
 wp.onchange = () => { cfg.wifi_awake = wp.checked; save(); log({ev: "setting", name: "wifi_awake", value: cfg.wifi_awake}); };
 st.onchange = () => { cfg.steady = st.checked; save(); log({ev: "setting", name: "steady", value: cfg.steady}); };
-function refresh() { showSync(); showHeat(); showFps(); showRate(); showSteady(); showMode(); showInput(); showFold(); showPlace(); showSliders(); showSound(); applyDelay(); }
+// The phone's encoder: H.264 or HEVC; a change starts it again.
+const cd = document.getElementById("cd");
+function showCodec() { cd.value = cfg.codec === "hevc" ? "hevc" : "h264"; }
+cd.onchange = () => {
+  cfg.codec = cd.value; save();
+  log({ev: "setting", name: "codec", value: cfg.codec});
+  note("Starting again in " + (cfg.codec === "hevc" ? "HEVC" : "H.264") + "\\u2026");
+};
+function refresh() { showCodec(); showSync(); showHeat(); showFps(); showRate(); showSteady(); showMode(); showInput(); showFold(); showPlace(); showSliders(); showSound(); applyDelay(); }
 refresh();
 
 const pc = new RTCPeerConnection();
@@ -1046,8 +1057,26 @@ async function connect() {
   // picture comes (vp8IfNothing).
   const caps = RTCRtpReceiver.getCapabilities("video");
   const codecs = caps ? caps.codecs : [];
-  const codec = P.get("codec") || keptCodec()
+  let codec = P.get("codec") || keptCodec()
     || (!caps || codecs.some(c => /h264/i.test(c.mimeType)) ? "h264" : "vp8");
+  // HEVC from the phone: over WebRTC if this browser lists it, by
+  // WebCodecs in DIRECT if it decodes it; else H.264, set on the phone
+  // (it starts again) and said here.
+  if (phone.codec === "hevc") {
+    let ok;
+    if (cfg.direct && directOk()) {
+      try { ok = (await VideoDecoder.isConfigSupported({codec: HEVC})).supported; }
+      catch (e) { ok = false; }
+    } else ok = codecs.some(c => /h265|hevc/i.test(c.mimeType));
+    log({ev: "hevc", ok, direct: cfg.direct});
+    if (!ok) {
+      cfg.codec = "h264"; save(); showCodec();
+      note("This browser plays no HEVC here: H.264 instead");
+      setTimeout(reloadWhenUp, 1500);
+      return;
+    }
+    codec = "h265";
+  }
   log({ev: "codecs", list: [...new Set(codecs.map(c => c.mimeType))], codec});
   // DIRECT's video comes by WebSocket and WebCodecs, not WebRTC: it needs
   // no H.264 in the browser's WebRTC (Firefox has none without OpenH264,
@@ -1057,7 +1086,7 @@ async function connect() {
   // A screen of its own still to make (Client, Multi-monitor): at this
   // window's shape at once, not fitted by a second restart.
   const fit = phone.waiting ? fitted(phone.long || 1280) : null;
-  const asked = await fetch(withKey("/offer?codec=" + (cfg.direct ? "h264" : codec)
+  const asked = await fetch(withKey("/offer?codec=" + (cfg.direct && codec !== "h265" ? "h264" : codec)
                                     + "&mbps=" + cfg.rate
                                     + (cfg.direct ? "&direct=1" : "")
                                     + (fit ? "&w=" + fit[0] + "&h=" + fit[1] : "")));
@@ -1740,7 +1769,7 @@ def raw_source(fd, size):
     return f"fdsrc fd={fd} blocksize={width * height * 3 // 2}"
 
 
-def hardware(size, parse=True, mbps=6.0, gop=10):
+def hardware(size, parse=True, mbps=6.0, gop=10, codec="h264"):
     """Elements from raw NV12 frames to H.264, by the phone's encoder, from
     the bytes of a pipe (PARSE) or from frames, a keyframe every GOP
     seconds.  If the encoder falls behind, the oldest frame waiting is
@@ -1764,13 +1793,21 @@ def hardware(size, parse=True, mbps=6.0, gop=10):
          f'plane-offsets="<0,{width * height}>" ! ' if parse else "")
         + "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 "
         "leaky=downstream ! "
-        'v4l2h264enc name=enc extra-controls="controls,'
-        f'video_bitrate_mode=1,video_bitrate={int(mbps * 1e6)},'
-        f'video_peak_bitrate={int(mbps * 1e6)},'
-        f'intra_refresh_period={int(fps)},intra_refresh_period_type=1,'
-        f'video_gop_size={gop * int(fps)},h264_i_frame_period={gop * int(fps)};" ! '
-        "video/x-h264,profile=constrained-baseline,level=(string)4 ! "
-        "h264parse config-interval=-1"
+        + (('v4l2h265enc name=enc extra-controls="controls,'
+            f'video_bitrate_mode=1,video_bitrate={int(mbps * 1e6)},'
+            f'video_peak_bitrate={int(mbps * 1e6)},'
+            f'intra_refresh_period={int(fps)},intra_refresh_period_type=1,'
+            f'video_gop_size={gop * int(fps)};" ! '
+            "video/x-h265,profile=main,level=(string)4 ! "
+            "h265parse config-interval=-1")
+           if codec == "hevc" else
+           ('v4l2h264enc name=enc extra-controls="controls,'
+            f'video_bitrate_mode=1,video_bitrate={int(mbps * 1e6)},'
+            f'video_peak_bitrate={int(mbps * 1e6)},'
+            f'intra_refresh_period={int(fps)},intra_refresh_period_type=1,'
+            f'video_gop_size={gop * int(fps)},h264_i_frame_period={gop * int(fps)};" ! '
+            "video/x-h264,profile=constrained-baseline,level=(string)4 ! "
+            "h264parse config-interval=-1"))
     )
 
 
@@ -2423,8 +2460,8 @@ class Producer:
         self.pipeline = Gst.parse_launch(
             "appsrc name=in is-live=true format=time do-timestamp=true "
             "leaky-type=downstream max-buffers=1 ! "
-            f"{hardware(size, parse=False, mbps=mbps)} ! "
-            f"{self.CAPS} ! appsink name=out emit-signals=true sync=false "
+            f"{hardware(size, parse=False, mbps=mbps, codec=CODEC)} ! "
+            f"{video_caps()} ! appsink name=out emit-signals=true sync=false "
             "max-buffers=4 drop=true")
         self.input = self.pipeline.get_by_name("in")
         self.encoder = self.pipeline.get_by_name("enc")
@@ -2882,7 +2919,7 @@ class Screencast(Producer):
         self.holding = False
         self.proc = subprocess.Popen(
             [SCREENCAST, "-o", output, "-s", size.split("@")[0], "-r", str(self.fps),
-             "-b", str(int(mbps * 1e6))],
+             "-b", str(int(mbps * 1e6)), "-c", CODEC],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.running = True
         threading.Thread(target=self.read, daemon=True).start()
@@ -2936,12 +2973,17 @@ class Screencast(Producer):
             log_line(f"wl-cast-capture ended ({self.proc.poll()})")
 
     def with_headers(self, data):
-        """Venus puts SPS and PPS only before the first keyframe; a viewer
-        joining later needs them before its own."""
+        """Venus puts the parameter sets (SPS and PPS; HEVC's VPS too) only
+        before the first keyframe; a viewer joining later needs them
+        before its own."""
         nals = re.split(b"(?=\x00\x00\x00\x01)", data)
-        kinds = [x[4] & 0x1F for x in nals if len(x) > 4]
-        if 7 in kinds:
-            self.headers = b"".join(x for x in nals if len(x) > 4 and x[4] & 0x1F in (7, 8))
+        if CODEC == "hevc":
+            kind, sets = (lambda x: (x[4] >> 1) & 0x3F), (32, 33, 34)
+        else:
+            kind, sets = (lambda x: x[4] & 0x1F), (7, 8)
+        kinds = [kind(x) for x in nals if len(x) > 4]
+        if sets[0] in kinds:
+            self.headers = b"".join(x for x in nals if len(x) > 4 and kind(x) in sets)
             return data
         return self.headers + data
 
@@ -3016,6 +3058,21 @@ SCREENCAST = (None if _sc == "0" else _sc if os.path.isfile(_sc)
 
 
 producer = None
+# The phone's encoder's codec, "h264" or "hevc": the page's SET (CODEC in
+# its settings), read at each start; a change starts the server again.
+CODEC = "h264"
+
+
+def video_caps():
+    """The encoded frames' caps, as hardware() and wl-cast-capture make them."""
+    if CODEC == "hevc":
+        return ("video/x-h265,stream-format=byte-stream,alignment=au,"
+                "profile=main,level=(string)4")
+    return Producer.CAPS
+
+
+def video_parse():
+    return "h265parse" if CODEC == "hevc" else "h264parse"
 
 
 # The sound: what the phone plays (the default output's monitor, through
@@ -3459,7 +3516,7 @@ class Session:
         self.video_channel = None   # DIRECT: the RTP video closed after the offer
         self.offer_ready = threading.Event()
         self.offer = None
-        self.producer = producer if codec == "h264" and size else None
+        self.producer = producer if codec in ("h264", "h265") and size else None
         self.proc = (None if self.producer
                      else subprocess.Popen(command, stdout=subprocess.PIPE))
         # RTP packets of at most 1200 bytes, as WebRTC usually sends: the
@@ -3478,10 +3535,14 @@ class Session:
                        if size else ""),
             "vp8": "ivfparse ! valve name=vv ! rtpvp8pay pt=96 mtu=1200 ! "
                    "application/x-rtp,media=video,encoding-name=VP8,payload=96",
+            # HEVC from the phone's encoder, for a browser that plays it
+            # over WebRTC (the page asks only then).
+            "h265": "valve name=vv ! rtph265pay config-interval=-1 pt=96 mtu=1200 ! "
+                    "application/x-rtp,media=video,encoding-name=H265,payload=96",
         }[codec]
         self.pipeline = Gst.parse_launch(
             (f"appsrc name=frames is-live=true format=time do-timestamp=true "
-             f"leaky-type=downstream max-buffers=4 caps={Producer.CAPS}"
+             f"leaky-type=downstream max-buffers=4 caps={video_caps()}"
              if self.producer
              else raw_source(self.proc.stdout.fileno(), size) if size
              else f"fdsrc fd={self.proc.stdout.fileno()}")
@@ -4195,7 +4256,7 @@ class Hls:
             f"location={self.dir}/segment%05d.ts "
             f"playlist-location={self.dir}/live.m3u8 "
             "appsrc name=v is-live=true format=time do-timestamp=true "
-            f"caps={Producer.CAPS} ! h264parse config-interval=-1 ! queue ! hls.video "
+            f"caps={video_caps()} ! {video_parse()} config-interval=-1 ! queue ! hls.video "
             f"pulsesrc device={sound} buffer-time=200000 latency-time=20000 "
             "slave-method=re-timestamp ! audioconvert ! audioresample ! "
             "audio/x-raw,rate=48000,channels=2 ! voaacenc bitrate=128000 ! "
@@ -4408,6 +4469,7 @@ class Handler(BaseHTTPRequestHandler):
                                    "wifi_powersave": wifi_powersave(),
                                    "live": producer.rate() if producer else None,
                                    "screen": screen.mode if screen else "phone",
+                                   "codec": CODEC,
                                    "screen_mode": (screen.mode if screen else
                                                    Handler.screen_waiting or "phone"),
                                    "size": Handler.size.split("@")[0] if Handler.size else None,
@@ -4426,7 +4488,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(b"{}", "application/json")
         elif self.path.startswith("/offer"):
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
-            codec = "h264" if query.get("codec") == ["h264"] else "vp8"
+            codec = {"h264": "h264", "h265": "h265"}.get((query.get("codec") or [""])[0], "vp8")
             # The page's rate, unless the producer's encoder has its own: a
             # different rate for each page restarted the server for each,
             # and two pages open kept it restarting (2026-11-19).  Its rate
@@ -4459,7 +4521,8 @@ class Handler(BaseHTTPRequestHandler):
                 GLib.idle_add(lambda: reexec() and False)
                 return
             created = {"done": threading.Event()}
-            GLib.idle_add(new_session, self.capture[codec], codec, self.size, created,
+            GLib.idle_add(new_session, self.capture["h264" if codec == "h265" else codec],
+                          codec, self.size, created,
                           query.get("direct") == ["1"])
             if (
                 created["done"].wait(10)
@@ -4611,6 +4674,10 @@ class Handler(BaseHTTPRequestHandler):
             with open(SETTINGS + ".new", "w") as f:
                 json.dump(kept, f)
             os.replace(SETTINGS + ".new", SETTINGS)
+            if producer and kept.get("codec", "h264") in ("h264", "hevc") \
+                    and kept.get("codec", "h264") != CODEC:
+                log_line(f"codec {kept.get('codec')}: starting again")
+                GLib.idle_add(lambda: restart_session() and False)
             if producer:
                 producer.steady = bool(kept.get("steady", False))
                 producer.adaptive = bool(kept.get("adaptive", True))
@@ -4680,7 +4747,7 @@ def main():
     if sys.argv[1:2] == ["udp"] and len(sys.argv) > 5:
         send_udp(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:])
         return
-    global remote, portal, producer, VIEW_ONLY
+    global remote, portal, producer, VIEW_ONLY, CODEC
     args = sys.argv[1:]
     if args[:1] == ["--raw"]:
         Handler.size, args = args[1], args[2:]
@@ -4754,6 +4821,7 @@ def main():
     if Handler.size:
         Handler.target = int(os.environ.pop("WL_CAST_TARGET", "0")) or \
             int(Handler.size.split("@")[1])
+    CODEC = "hevc" if kept_setting("codec", "h264") == "hevc" else "h264"
     if portal == "screencast" and Handler.size:
         try:
             producer = Screencast(screen.name if screen else PANEL,

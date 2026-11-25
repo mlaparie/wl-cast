@@ -1,7 +1,7 @@
 /* wl-cast-capture — the screen to H.264 with no CPU copy of a pixel.
  *
  *   wl-cast-capture [-o OUTPUT] [-s WxH] [-r FPS] [-b BITRATE] [-g GOP]
- *                    [-t TURN] [-n FRAMES]
+ *                    [-c h264|hevc] [-t TURN] [-n FRAMES]
  *
  * As scrcpy does on Android (the encoder's input surface), but on Sway:
  *   1. Sway copies the output into a GPU buffer of ours (wlr-screencopy,
@@ -20,6 +20,9 @@
  *
  * Defaults: the first output, 1600x800, 20 fps, 2 Mbit/s constant, a keyframe
  * every 10 s, the turn of the output (0, 90, 180 or 270; -t overrides).
+ * -c hevc: HEVC (Main, level 4) in place of H.264 (constrained baseline,
+ * level 4); its parameter sets (VPS, SPS, PPS) likewise only before the
+ * first keyframe.
  * -n FRAMES: stop after that many frames (tests).
  *
  * State: written 2026-11-20; see the end of device/stream/README.
@@ -79,6 +82,7 @@ static uint64_t now_us(clockid_t clk)
 /* ---- options ---- */
 static const char *want_output;  /* NULL: the first output */
 static int W = 1600, H = 800, FPS = 20, BITRATE = 2000000, GOP_S = 10;
+static bool HEVC;
 static int TURN = -1;           /* -1: the output's own */
 static long FRAMES = 0;
 
@@ -345,7 +349,7 @@ static void venus_setup(void)
 	struct v4l2_format f = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE };
 	f.fmt.pix_mp.width = W;
 	f.fmt.pix_mp.height = H;
-	f.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_H264;
+	f.fmt.pix_mp.pixelformat = HEVC ? V4L2_PIX_FMT_HEVC : V4L2_PIX_FMT_H264;
 	f.fmt.pix_mp.num_planes = 1;
 	f.fmt.pix_mp.plane_fmt[0].sizeimage = 1024 * 1024;
 	if (xioctl(enc, VIDIOC_S_FMT, &f) < 0)
@@ -388,10 +392,15 @@ static void venus_setup(void)
 	ctrl(V4L2_CID_MPEG_VIDEO_BITRATE_MODE, V4L2_MPEG_VIDEO_BITRATE_MODE_CBR, "bitrate mode");
 	ctrl(V4L2_CID_MPEG_VIDEO_BITRATE, BITRATE, "bitrate");
 	ctrl(V4L2_CID_MPEG_VIDEO_GOP_SIZE, GOP_S * FPS, "gop");
-	ctrl(V4L2_CID_MPEG_VIDEO_H264_I_PERIOD, GOP_S * FPS, "i period");
-	ctrl(V4L2_CID_MPEG_VIDEO_H264_PROFILE,
-	     V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE, "profile");
-	ctrl(V4L2_CID_MPEG_VIDEO_H264_LEVEL, V4L2_MPEG_VIDEO_H264_LEVEL_4_0, "level");
+	if (HEVC) {
+		ctrl(V4L2_CID_MPEG_VIDEO_HEVC_PROFILE, V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN, "profile");
+		ctrl(V4L2_CID_MPEG_VIDEO_HEVC_LEVEL, V4L2_MPEG_VIDEO_HEVC_LEVEL_4, "level");
+	} else {
+		ctrl(V4L2_CID_MPEG_VIDEO_H264_I_PERIOD, GOP_S * FPS, "i period");
+		ctrl(V4L2_CID_MPEG_VIDEO_H264_PROFILE,
+		     V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE, "profile");
+		ctrl(V4L2_CID_MPEG_VIDEO_H264_LEVEL, V4L2_MPEG_VIDEO_H264_LEVEL_4_0, "level");
+	}
 	/* Venus does not repeat SPS and PPS before later keyframes
 	 * (PREPEND_SPSPPS_TO_IDR: EINVAL): the reader keeps the first ones. */
 	ctrl(V4L2_CID_MPEG_VIDEO_B_FRAMES, 0, "no B frames");
@@ -707,17 +716,18 @@ static void command(void)
 int main(int argc, char **argv)
 {
 	int opt;
-	while ((opt = getopt(argc, argv, "o:s:r:b:g:t:n:")) != -1) {
+	while ((opt = getopt(argc, argv, "o:s:r:b:g:c:t:n:")) != -1) {
 		switch (opt) {
 		case 'o': want_output = optarg; break;
 		case 's': if (sscanf(optarg, "%dx%d", &W, &H) != 2) fail("-s WxH"); break;
 		case 'r': FPS = atoi(optarg); break;
 		case 'b': BITRATE = atoi(optarg); break;
 		case 'g': GOP_S = atoi(optarg); break;
+		case 'c': HEVC = !strcmp(optarg, "hevc"); break;
 		case 't': TURN = atoi(optarg); break;
 		case 'n': FRAMES = atol(optarg); break;
 		default: fail("usage: wl-cast-capture [-o OUTPUT] [-s WxH] [-r FPS] "
-			      "[-b BITRATE] [-g GOP_S] [-t TURN] [-n FRAMES]");
+			      "[-b BITRATE] [-g GOP_S] [-c h264|hevc] [-t TURN] [-n FRAMES]");
 		}
 	}
 	/* Gone with the server that started it, however it ends. */
