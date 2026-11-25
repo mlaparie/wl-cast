@@ -23,7 +23,7 @@ The page has a few buttons of its own (sound, keyboard, settings). Add yours in 
 
 Everything specific to your host goes in an optional `~/.config/wl-cast/hook` script, see `examples/hook`: keeping the screen awake, Wi-Fi power saving, and your gesture tool on the viewer's touches, so edge swipes work from the stream as they do on the screen for instance.
 
-While it streams, the sound plays on your output and on a new one, "Stream viewer", which is what the viewer hears: pick your own output alone in your sound settings to keep the sound on the host, Stream viewer alone to hear it only on the viewer's side. Both come back as before when the stream ends, and the choice is kept for the next streams (it needs `pactl`). Without `-s`, the stream starts in the screen mode last chosen on the page.
+While it streams, the sound goes to a new output, "Stream viewer", which is what the viewer hears: pick your own output in your sound settings to keep the sound on the host, or "Host and stream viewer" for both (two headsets, or someone in the room). Both come back as before when the stream ends, and the choice is kept for the next streams (it needs `pactl`). Without `-s`, the stream starts in the screen mode last chosen on the page.
 
 The screen stays awake while streaming (`-w off` to let it blank), through your hook or else by pausing swayidle. A screen turned off is not captured, so with `wl-cast start -d`, the key that normally blanks it (the power key, bound to `wl-cast dim || <your blank command>`) toggles a black screen instead while the stream runs, and blanks as usual otherwise. `-T` also turns the screen's own touch input off while dimmed. The brightness comes back when the stream ends.
 

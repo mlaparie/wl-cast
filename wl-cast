@@ -108,8 +108,9 @@ stop() {
 
 # The stream's sound has an output of its own, "Stream viewer", so that
 # the host's sound settings choose where it plays: the host's output alone
-# (host only), Stream viewer alone (the viewer only), or both, as at start
-# (a combined output, the default at the first stream).  The choice made
+# (host only), Stream viewer alone (the viewer only, the default at the
+# first stream: the common case, author 2026-11-25), or both (a combined
+# output: two headsets, or the host's speaker for someone in the room).  The choice made
 # during a stream is kept for the next ones (author, 2026-11-25: it went
 # back to both at every stream): $state/sound, host, viewer or both,
 # written as a stream ends.  The server sends what plays on Stream viewer.  $sound_file: the modules, then the
@@ -135,7 +136,7 @@ sound_up() {
         { pactl unload-module "$viewer"; return 0; }
     printf '%s %s\n%s\n' "$viewer" "$both" "$host" > "$sound_file"
     case "$(cat "$state/sound" 2>/dev/null)" in
-        viewer) want=wl_cast_viewer ;; host) want=$host ;; *) want=wl_cast_both ;;
+        both) want=wl_cast_both ;; host) want=$host ;; *) want=wl_cast_viewer ;;
     esac
     # PipeWire picks the default again once a new output is ready: set it
     # until it holds (2 s at most).
