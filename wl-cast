@@ -155,6 +155,12 @@ sound_down() {
         wl_cast_viewer) echo viewer > "$state/sound" ;;
         wl_cast_both) echo both > "$state/sound" ;;
         "$host") echo host > "$state/sound" ;;
+        *)  # Both picked in the host's own settings: a combined output of
+            # theirs that holds Stream viewer.
+            pactl list modules short 2>/dev/null |
+                awk -v d="sink_name=$now" '$2 == "module-combine-sink" &&
+                    index($0, d) && index($0, "wl_cast_viewer") { f = 1 } END { exit !f }' &&
+                echo both > "$state/sound" ;;
     esac
     case "$now" in
         wl_cast_*) set_sink "$host" ;;
