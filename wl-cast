@@ -109,8 +109,10 @@ stop() {
 # The stream's sound has an output of its own, "Stream viewer", so that
 # the host's sound settings choose where it plays: the host's output alone
 # (host only), Stream viewer alone (the viewer only), or both, as at start
-# (a combined output, the default until the stream ends).  The server
-# sends what plays on Stream viewer.  $sound_file: the modules, then the
+# (a combined output, the default at the first stream).  The choice made
+# during a stream is kept for the next ones (author, 2026-11-25: it went
+# back to both at every stream): $state/sound, host, viewer or both,
+# written as a stream ends.  The server sends what plays on Stream viewer.  $sound_file: the modules, then the
 # host's output, for sound_down and for the host's settings (the Pro¹x's
 # quick actions read it).  Without pactl: the default output's sound, as
 # before.
@@ -132,18 +134,28 @@ sound_up() {
                "sink_properties='device.description=\"Host and stream viewer\"'") ||
         { pactl unload-module "$viewer"; return 0; }
     printf '%s %s\n%s\n' "$viewer" "$both" "$host" > "$sound_file"
+    case "$(cat "$state/sound" 2>/dev/null)" in
+        viewer) want=wl_cast_viewer ;; host) want=$host ;; *) want=wl_cast_both ;;
+    esac
     # PipeWire picks the default again once a new output is ready: set it
     # until it holds (2 s at most).
     for _ in 1 2 3 4 5 6 7 8; do
-        [ "$(pactl get-default-sink)" = wl_cast_both ] && break
-        set_sink wl_cast_both; sleep 0.25
+        [ "$(pactl get-default-sink)" = "$want" ] && break
+        set_sink "$want"; sleep 0.25
     done
     export WL_CAST_SOUND=wl_cast_viewer.monitor
 }
 sound_down() {
     [ -f "$sound_file" ] || return 0
     { read -r mods; read -r host; } < "$sound_file"
-    case "$(pactl get-default-sink 2>/dev/null)" in
+    now=$(pactl get-default-sink 2>/dev/null)
+    mkdir -p "$state"
+    case "$now" in
+        wl_cast_viewer) echo viewer > "$state/sound" ;;
+        wl_cast_both) echo both > "$state/sound" ;;
+        "$host") echo host > "$state/sound" ;;
+    esac
+    case "$now" in
         wl_cast_*) set_sink "$host" ;;
     esac
     for m in $mods; do pactl unload-module "$m" 2>/dev/null; done
