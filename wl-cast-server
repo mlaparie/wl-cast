@@ -184,7 +184,12 @@ def buttons_html():
                 places[place].append(f'<button class="x ub" data-n="{i}">'
                                      f'{html.escape(parts[0])}</button>')
                 i += 1
-    places["bottom-left"][:0] = [BUILTIN[b] for b in BUILTIN if b not in seen]
+    # The built-ins not placed go first, but the rows' arrow last, at the
+    # right end of the keys' row (author, 2026-11-25).
+    places["bottom-left"][:0] = [BUILTIN[b] for b in BUILTIN
+                                 if b not in seen and b != "place"]
+    if "place" not in seen:
+        places["bottom-left"].append(BUILTIN["place"])
     return ("".join(places["top-right"]).encode(),
             "".join(places["bottom-left"]).encode())
 
@@ -262,8 +267,10 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
 #c{display:none}
 #bar{position:fixed;top:4px;right:4px;display:flex;flex-wrap:wrap;justify-content:flex-end;
   gap:3px;opacity:.6;z-index:3;max-width:calc(100vw - 8px)}
-#kbar{position:fixed;bottom:4px;left:4px;display:flex;flex-wrap:wrap;
-  gap:3px;opacity:.6;z-index:3;max-width:calc(100vw - 8px)}
+#kbar{position:fixed;bottom:4px;left:4px;right:4px;display:flex;flex-wrap:wrap;
+  gap:3px;opacity:.6;z-index:3;pointer-events:none}
+#kbar button{pointer-events:auto}
+#bw2{margin-left:auto}
 #bar button,#kbar button{font:12px monospace;background:#222;color:#eee;border:1px solid #555;
   border-radius:0;padding:4px 7px}
 #bar.folded .x,#bar.folded ~ #kbar .x{display:none}
@@ -275,9 +282,11 @@ button.flash{animation:flash .3s ease-out}
 #wheel button{position:absolute;transform:translate(-50%,-50%);font:13px monospace;
   background:#222;color:#eee;border:1px solid #777;border-radius:14px;padding:8px 10px}
 #bar[data-view] .host,#bar[data-view] ~ #kbar{display:none}
-/* LOW: the bar at the bottom and the keys at the top, out from under
-   something that covers the top of the screen (a car's dashboard). */
-body.low #bar{top:auto;bottom:4px}body.low #kbar{bottom:auto;top:4px}
+/* LOW: the bar at the bottom, and KEYSTOP: the keys at the top, each on
+   its own (author, 2026-11-25), out from under something that covers an
+   edge (a car's dashboard).  On the same edge, the keys go beside the
+   bar's side (showPlace). */
+body.low #bar{top:auto;bottom:4px}body.keystop #kbar{bottom:auto;top:4px}
 body.low #set{top:auto;bottom:64px}
 #info{position:fixed;left:6px;top:40px;font:11px monospace;color:#eee;
   background:rgba(0,0,0,.75);padding:8px;display:none;z-index:1}
@@ -648,8 +657,9 @@ document.getElementById("bi").onclick = () => {
   // Not moved yet: just below the buttons at the top (the bar, or the
   // keys with the bar at the bottom), its top line clear of them.
   if (on && !info.style.top) {
-    const above = document.getElementById(cfg.low ? "kbar" : "bar").getBoundingClientRect();
-    info.style.top = Math.round(Math.max(6, above.height ? above.bottom + 4 : 6)) + "px";
+    const tops = [!cfg.low && "bar", cfg.keystop && "kbar"].filter(Boolean)
+      .map(id => document.getElementById(id).getBoundingClientRect().bottom);
+    info.style.top = Math.round(Math.max(6, ...tops.map(b => b + 4))) + "px";
   }
   if (on) { tick(); drawGraph(); }
 };
@@ -710,22 +720,31 @@ const bar = document.getElementById("bar"), bc = document.getElementById("bc");
 function showFold() {
   bar.classList.toggle("folded", cfg.folded);
   bc.textContent = cfg.folded ? "\\u2261" : "\\u00d7";
+  try { showPlace(); } catch (e) {}   // the bar's height changed (not yet set up at load)
 }
 bc.onclick = () => { cfg.folded = !cfg.folded; save(); showFold(); };
-// The buttons at the top or the bottom, an arrow to the other side.
-const bw = document.getElementById("bw");
+// The bar and the keys' row each at the top or the bottom, with an arrow
+// to the other edge (author, 2026-11-25: on their own, not swapped).
+// Settings kept from before had one choice for both: the keys opposite.
+if (cfg.keystop === undefined) cfg.keystop = !!cfg.low;
+const bw = document.getElementById("bw"), bw2 = document.getElementById("bw2");
+const kbar = document.getElementById("kbar");
 function showPlace() {
-  document.body.classList.toggle("low", cfg.low);
+  document.body.classList.toggle("low", !!cfg.low);
+  document.body.classList.toggle("keystop", !!cfg.keystop);
   bw.textContent = cfg.low ? "\\u2191 TOP" : "\\u2193 BOTTOM";
-  // The keys' row has its own, for the other edge (author, 2026-11-25).
-  if (bw2) bw2.textContent = cfg.low ? "\\u2193 BOTTOM" : "\\u2191 TOP";
+  if (bw2) bw2.textContent = cfg.keystop ? "\\u2193 BOTTOM" : "\\u2191 TOP";
+  // On the same edge, the keys clear of the bar.
+  const gap = bar.getBoundingClientRect().height + 8 + "px";
+  kbar.style.top = !cfg.low && cfg.keystop ? gap : "";
+  kbar.style.bottom = cfg.low && !cfg.keystop ? gap : "";
 }
 bw.onclick = () => { cfg.low = !cfg.low; save(); showPlace(); };
-const bw2 = document.getElementById("bw2");
 if (bw2) {
   bw2.addEventListener("mousedown", e => e.preventDefault());   // the LKB stays open
-  bw2.onclick = bw.onclick;
+  bw2.onclick = () => { cfg.keystop = !cfg.keystop; save(); showPlace(); };
 }
+addEventListener("resize", showPlace);
 const set = document.getElementById("set");
 document.getElementById("bs").onclick = () =>
   set.style.display = set.style.display === "block" ? "none" : "block";

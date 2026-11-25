@@ -19,7 +19,7 @@ You can add your own scripts around it, _e.g._, `examples/car-bluetooth` starts 
 
 ## Your own buttons and gestures
 
-The page has a few buttons of its own (sound, keyboard, settings). Add yours in `~/.config/wl-cast/buttons`, one per line with a label and a command/script, _e.g._, a window switcher, a launcher, an on-screen keyboard. `examples/buttons` has placeholders. Three fingers tapped on the page fold or show the buttons; held, they show them on a wheel around the fingers, which hides once one is pressed. The keys' row has its own arrow, which moves both rows to the other edge. DIM shows held while the screen is dimmed. The arrow button moves them from the top to the bottom and back, out from under something that covers that edge.
+The page has a few buttons of its own (sound, keyboard, settings). Add yours in `~/.config/wl-cast/buttons`, one per line with a label and a command/script, _e.g._, a window switcher, a launcher, an on-screen keyboard. `examples/buttons` has placeholders. Three fingers tapped on the page fold or show the buttons; held, they show them on a wheel around the fingers, which hides once one is pressed. DIM shows held while the screen is dimmed. Each row of buttons has an arrow that moves it to the top or the bottom on its own, out from under something that covers that edge; the keys' arrow sits at the right end of its row.
 
 Everything specific to your host goes in an optional `~/.config/wl-cast/hook` script, see `examples/hook`: keeping the screen awake, Wi-Fi power saving, and your gesture tool on the viewer's touches, so edge swipes work from the stream as they do on the screen for instance.
 
