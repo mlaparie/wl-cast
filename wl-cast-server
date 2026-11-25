@@ -1406,7 +1406,7 @@ setInterval(async () => {
 // (a tap clicks, a drag drags, a long press right-clicks, two fingers
 // scroll).  Pad: a touchpad moving the Pro1x's pointer from where it is (a
 // tap clicks, two fingers tap to right-click and drag to scroll, a press
-// held then moved drags).  Positions in the picture, 0 to 1.
+// held then moved drags, a finger on the right or bottom edge scrolls).  Positions in the picture, 0 to 1.
 function norm(e) {
   const r = shown().getBoundingClientRect();
   const vw = picW() || r.width, vh = picH() || r.height;
@@ -1417,7 +1417,15 @@ function norm(e) {
 }
 const active = new Map();
 let down = false, start = null, scrollAt = null, timer = null, moved = false;
-let padLast = null, padStart = 0, padMax = 0, padHeld = false;
+let padLast = null, padStart = 0, padMax = 0, padHeld = false, padEdge = null;
+// Pad: a finger down on the right edge scrolls up and down as it moves,
+// on the bottom edge left and right, as on a laptop's touchpad (author,
+// 2026-11-25).  The edge: 7% of the shorter side, at least 40 px.
+function edgeOf(e) {
+  const band = Math.max(40, 0.07 * Math.min(innerWidth, innerHeight));
+  return e.clientX > innerWidth - band ? "right"
+       : e.clientY > innerHeight - band ? "bottom" : null;
+}
 function centre() {
   let x = 0, y = 0;
   for (const p of active.values()) { x += p.clientX; y += p.clientY; }
@@ -1518,10 +1526,13 @@ function press(e) {
     if (active.size === 1) {
       padLast = {x: e.clientX, y: e.clientY}; padStart = Date.now(); padMax = 1;
       moved = false; padHeld = false;
+      padEdge = edgeOf(e);
+      if (padEdge) { scrollAt = {x: e.clientX, y: e.clientY}; return; }
       timer = setTimeout(() => {
         if (!moved) { padHeld = true; send({t: "rbtn", b: "left", d: 1}); }
       }, 400);
     } else {
+      padEdge = null;
       clearTimeout(timer); padMax = Math.max(padMax, active.size);
       scrollAt = centre();
     }
@@ -1557,6 +1568,16 @@ function move(e) {
     return;
   }
   if (cfg.input === "pad") {
+    if (active.size === 1 && padEdge && scrollAt) {
+      const d = padEdge === "right" ? e.clientY - scrollAt.y : e.clientX - scrollAt.x, step = 20;
+      if (Math.abs(d) >= step) {
+        moved = true;
+        send(padEdge === "right" ? {t: "scroll", v: Math.round(d / step), h: 0}
+                                 : {t: "scroll", v: 0, h: Math.round(-d / step)});
+        scrollAt = {x: e.clientX, y: e.clientY};
+      }
+      return;
+    }
     if (active.size === 1 && padLast) {
       const dx = e.clientX - padLast.x, dy = e.clientY - padLast.y;
       if (Math.abs(dx) + Math.abs(dy) > 0) {
@@ -1599,11 +1620,13 @@ function release(e) {
     clearTimeout(timer);
     if (active.size === 0) {
       if (padHeld) send({t: "rbtn", b: "left", d: 0});
+      else if (padEdge) { if (!moved && Date.now() - padStart < 300) {
+        send({t: "rbtn", b: "left", d: 1}); send({t: "rbtn", b: "left", d: 0}); } }
       else if (!moved && Date.now() - padStart < 300) {
         const b = padMax >= 2 ? "right" : "left";
         send({t: "rbtn", b, d: 1}); send({t: "rbtn", b, d: 0});
       }
-      padLast = null; scrollAt = null; padHeld = false;
+      padLast = null; scrollAt = null; padHeld = false; padEdge = null;
     } else {
       // The finger left takes over the moving.
       const p = active.values().next().value;
