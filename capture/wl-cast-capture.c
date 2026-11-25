@@ -482,11 +482,14 @@ static void f_flags(void *d, struct zwlr_screencopy_frame_v1 *f, uint32_t flags)
 	(void)d; (void)f;
 	frame_shot->y_invert = flags & ZWLR_SCREENCOPY_FRAME_V1_FLAGS_Y_INVERT;
 }
+static uint64_t last_copy_us, last_ready_us, frame_us;
+
 static void f_ready(void *d, struct zwlr_screencopy_frame_v1 *f, uint32_t sec_hi,
 		    uint32_t sec_lo, uint32_t nsec)
 {
 	(void)d;
 	struct shot *s = frame_shot;
+	last_ready_us = now_us(CLOCK_MONOTONIC);
 	s->mono_us = (((uint64_t)sec_hi << 32 | sec_lo) * 1000000) + nsec / 1000;
 	s->busy = false;
 	s->ready = true;
@@ -528,7 +531,17 @@ static const struct zwlr_screencopy_frame_v1_listener frame_listener = {
 	f_buffer, f_flags, f_ready, f_failed, f_damage, f_linux_dmabuf, f_buffer_done,
 };
 
-static uint64_t last_copy_us;
+/* When to ask Sway for the next copy: 0.6 of a frame after the last one
+ * came.  Asked a whole frame after the last request, a request that came
+ * a little after a changed frame of a video waited for the next one, and
+ * the motion jumped (author, 2026-11-25); from the frame itself, every
+ * frame of a video at the chosen rate is caught, and a faster screen is
+ * still held to it.  After a failed copy, 5 ms after the request. */
+static uint64_t next_due(void)
+{
+	uint64_t due = last_ready_us + frame_us * 6 / 10;
+	return due > last_copy_us + 5000 ? due : last_copy_us + 5000;
+}
 
 static void request_copy(void)
 {
@@ -731,7 +744,7 @@ int main(int argc, char **argv)
 	venus_setup();
 	request_copy();
 
-	uint64_t frame_us = 1000000 / FPS;
+	frame_us = 1000000 / FPS;
 	for (;;) {
 		struct pollfd p[3] = {
 			{ wl_display_get_fd(display), POLLIN, 0 },
@@ -739,11 +752,10 @@ int main(int argc, char **argv)
 			{ stdin_open ? 0 : -1, POLLIN, 0 },
 		};
 		wl_display_flush(display);
-		/* At most FPS copies a second: the next one is asked a frame's
-		 * time after the last. */
+		/* At most FPS copies a second (next_due). */
 		int wait = -1;
 		if (!frame && !hold) {
-			uint64_t due = last_copy_us + frame_us, t = now_us(CLOCK_MONOTONIC);
+			uint64_t due = next_due(), t = now_us(CLOCK_MONOTONIC);
 			wait = due > t ? (int)((due - t) / 1000) : 0;
 		}
 		if (poll(p, 3, wait) < 0 && errno != EINTR)
@@ -759,7 +771,7 @@ int main(int argc, char **argv)
 		if (p[2].revents & (POLLIN | POLLHUP))
 			command();
 		encode_ready();
-		if (!frame && !hold && now_us(CLOCK_MONOTONIC) >= last_copy_us + frame_us)
+		if (!frame && !hold && now_us(CLOCK_MONOTONIC) >= next_due())
 			request_copy();
 	}
 }

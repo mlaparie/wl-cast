@@ -2858,6 +2858,7 @@ class Screencast(Producer):
         self.portal, self.mbps = None, mbps
         self.lock = threading.Lock()
         self.viewers = {}
+        self.viewer_pts = {}
         self.direct = {}
         self.asked_key = 0.0
         self.last = None
@@ -2930,7 +2931,7 @@ class Screencast(Producer):
             enc_ms = max(0, (done - captured) // 1000)
             with self.lock:
                 self.bench["encoder"].append(enc_ms)
-            self.deliver(data, key, enc_ms)
+            self.deliver(data, key, enc_ms, captured)
         if self.running:
             log_line(f"wl-cast-capture ended ({self.proc.poll()})")
 
@@ -2944,7 +2945,7 @@ class Screencast(Producer):
             return data
         return self.headers + data
 
-    def deliver(self, data, key, enc_ms):
+    def deliver(self, data, key, enc_ms, captured=None):
         with self.lock:
             viewers = [src for src, waiting in self.viewers.items() if key or not waiting]
             for src in viewers:
@@ -2953,10 +2954,25 @@ class Screencast(Producer):
             for send in direct:
                 self.direct[send] = False
         if viewers:
-            buf = Gst.Buffer.new_wrapped(data)
-            if not key:
-                buf.set_flags(Gst.BufferFlags.DELTA_UNIT)
+            # Timed as Sway gave the frame (CAPTURED, real time in µs), in
+            # each viewer pipeline's running time (the system clock is the
+            # monotonic one): timed as it arrived, the encoder's uneven
+            # time per frame showed as uneven motion (author, 2026-11-25).
+            # Out of order or over 1 s off: as it arrives (do-timestamp).
+            mono = None
+            if captured:
+                mono = int((captured / 1e6 - (time.time() - time.monotonic())) * 1e9)
             for src in viewers:
+                buf = Gst.Buffer.new_wrapped(data)
+                if not key:
+                    buf.set_flags(Gst.BufferFlags.DELTA_UNIT)
+                clock = src.get_clock()
+                if mono is not None and clock is not None:
+                    t = mono - src.get_base_time()
+                    now = clock.get_time() - src.get_base_time()
+                    if t > self.viewer_pts.get(src, -1) and abs(t - now) < Gst.SECOND:
+                        buf.pts = buf.dts = t
+                        self.viewer_pts[src] = t
                 src.emit("push-buffer", buf)
         for send in direct:
             if not send(data, key, enc_ms):
