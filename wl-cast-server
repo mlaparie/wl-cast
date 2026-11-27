@@ -3153,14 +3153,16 @@ def video_parse():
 # stayed: the source follows the pipeline's clock by retimestamping, not by
 # dropping or repeating samples (slave-method's default, skew, clicks).
 # 96 kbit/s with in-band FEC: cheaper on Wi-Fi, and a lost packet is rebuilt
-# from the next one rather than concealed.
+# from the next one rather than concealed.  Complexity 5 of 10: Opus's
+# search effort, most of the encoder's CPU, for a difference in quality
+# that 96 kbit/s does not show (Tesor sends raw PCM for the same reason).
 # WL_CAST_SOUND: another source, Stream viewer's monitor (wl-cast).
 AUDIO = (
     f"pulsesrc name=asrc device={os.environ.get('WL_CAST_SOUND') or '@DEFAULT_MONITOR@'} "
     "buffer-time=200000 latency-time=20000 "
     "slave-method=re-timestamp ! valve name=av ! "
     "audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! "
-    "opusenc bitrate=96000 frame-size=20 inband-fec=true packet-loss-percentage=5 ! "
+    "opusenc bitrate=96000 frame-size=20 complexity=5 inband-fec=true packet-loss-percentage=5 ! "
     "rtpopuspay pt=97 mtu=1200 ! "
     "application/x-rtp,media=audio,encoding-name=OPUS,payload=97"
 )
