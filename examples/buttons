@@ -10,9 +10,18 @@
 # page's own, and [bottom-left] back; =lkb, =place, =super, =ctrl and =alt place
 # the built-in ones where they appear.
 #
+# On the wheel (three fingers held), your buttons share one sector, APPS,
+# unless a line [group NAME] gives the ones after it a sector NAME of their
+# own (until the next [group] line; [group] alone goes back to APPS).  The
+# groups come in the order the file names them, before the page's own.
+#
 # The commands below are placeholders: put your own launcher, window
 # switcher, menu or on-screen keyboard there.
 OSK   notify-send wl-cast "OSK: your on-screen keyboard here"
 WIN   notify-send wl-cast "WIN: your window switcher here"
 QA    notify-send wl-cast "QA: your quick settings here"
 APPS  notify-send wl-cast "APPS: your app launcher here"
+# e.g. a second sector on the wheel:
+#[group MEDIA]
+#PLAY  playerctl play-pause
+#NEXT  playerctl next

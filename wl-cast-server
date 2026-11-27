@@ -143,7 +143,8 @@ def button_lines():
 def buttons():
     """The page's own buttons, CONFIG/buttons: one per line, its label and
     the command it runs ("WIN pro1x-menu toggle windowswitcher"); # starts
-    a comment.  Read again for every page and every press."""
+    a comment, [ a placing or a group line (buttons_html).  Read again for
+    every page and every press."""
     found = []
     for line in button_lines():
         parts = line.split(None, 1)
@@ -168,20 +169,25 @@ def buttons_html():
     """The two button bars: bottom left (the default) and top right, beside
     the page's own.  In CONFIG/buttons, [bottom-left] and [top-right] place
     the lines after them, and =lkb, =place, =super, =ctrl, =alt the built-in
-    buttons; those not placed go first at the bottom left."""
+    buttons; those not placed go first at the bottom left.  [group NAME]
+    puts the buttons after it in the wheel's group NAME (their own sector
+    of its inner ring; APPS without one), until the next [group] line."""
     import html
     places = {"bottom-left": [], "top-right": []}
-    place, i, seen = "bottom-left", 0, set()
+    place, i, seen, group = "bottom-left", 0, set(), ""
     for line in button_lines():
         if line in ("[bottom-left]", "[top-right]"):
             place = line[1:-1]
+        elif line.startswith("[group") and line.endswith("]"):
+            group = line[6:-1].strip()
         elif line.startswith("=") and line[1:] in BUILTIN:
             places[place].append(BUILTIN[line[1:]])
             seen.add(line[1:])
         else:
             parts = line.split(None, 1)
             if len(parts) == 2 and not parts[0].startswith(("#", "[", "=")):
-                places[place].append(f'<button class="x ub" data-n="{i}">'
+                g = f' data-g="{html.escape(group, quote=True)}"' if group else ""
+                places[place].append(f'<button class="x ub" data-n="{i}"{g}>'
                                      f'{html.escape(parts[0])}</button>')
                 i += 1
     # The built-ins not placed go first, but the rows' arrow last, after
@@ -273,13 +279,19 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
 #bar button,#kbar button{font:12px monospace;background:#222;color:#eee;border:1px solid #555;
   border-radius:0;padding:4px 7px}
 #bar.folded .x,#bar.folded ~ #kbar .x{display:none}
-#kbar button.held,#bar button.held,#wheel button.held{background:#875;color:#fff}
+#kbar button.held,#bar button.held{background:#875;color:#fff}
 button.flash{animation:flash .3s ease-out}
 @keyframes flash{from{background:#eee;color:#000}}
 #wheel{position:fixed;left:0;top:0;width:100%;height:100%;display:none;z-index:5;
   background:rgba(0,0,0,.35);touch-action:none}
-#wheel button{position:absolute;transform:translate(-50%,-50%);font:13px monospace;
-  background:#222;color:#eee;border:1px solid #777;border-radius:14px;padding:8px 10px}
+#wheel svg{position:absolute;overflow:visible}
+#wheel path{fill:#1a1a1a;fill-opacity:.94;stroke:#000;stroke-width:2}
+#wheel path.held{fill:#875}
+#wheel path.aim{fill:#e9e9e9;fill-opacity:1}
+#wheel text{font-family:monospace;font-weight:600;fill:#eee;pointer-events:none;text-anchor:middle;dominant-baseline:central}
+#wheel text.aim{fill:#000}
+#wheel text.mid{font-weight:700;fill:#fff}
+#wheel circle.mark{fill:#fff;stroke:#000;stroke-width:1.5}
 #bar[data-view] .host,#bar[data-view] ~ #kbar{display:none}
 /* LOW: the bar at the bottom, and KEYSTOP: the keys at the top, each on
    its own (author, 2026-11-25), out from under something that covers an
@@ -1471,45 +1483,150 @@ function mouseMove(e) {
   const n = norm(e);
   send({t: "move", x: n.x, y: n.y});
 }
-// A long press of three fingers: the page's buttons on a wheel around
-// them, within reach away from the edges.  A button on it pressed, or a
-// touch beside them, hides it (author, 2026-11-24).
+// Three fingers held: the page's buttons as the sectors of a two-ring
+// doughnut around them (author, 2026-11-24; sectors and groups,
+// 2026-11-27).  The inner ring holds the groups, the way the bars group
+// the buttons (the owner's by their [group NAME], then INPUT, PICTURE,
+// SOUND, STREAM, PAGE); the outer ring, the actions of the group the
+// fingers point at, fanned out around it.  Aim by moving the three fingers
+// from where they were held (the dead zone in the middle), lift to pick;
+// lifted in the middle or off a sector, it hides.  The pick is frozen
+// when the first finger leaves, since the others' centre jumps then.
+// The wheel is drawn clamped on screen; the aim is the fingers' movement
+// from their start, so it reads the same at an edge.
 const wheel = document.getElementById("wheel");
-let wheelTimer = null;
-function wheelButtons() {
+let wheelTimer = null, wheelOn = null;
+const GROUPS = [
+  ["INPUT", "#kbar .mod, #bk, #bt, #bp"],
+  ["PICTURE", "#bm, #bv, #bd"],
+  ["SOUND", "#bu, #by"],
+  ["STREAM", "#bz, #bx, #br"],
+  ["PAGE", "#bi, #bs, #bw, #bw2"],
+];
+function wheelGroups() {
   const view = bar.hasAttribute("data-view");
-  return [...document.querySelectorAll("#bar button, #kbar button")].filter(b =>
-    b.id !== "bc" && !(view && (b.classList.contains("host") || b.closest("#kbar"))));
+  const ok = b => b && !(view && (b.classList.contains("host") || b.closest("#kbar")));
+  const groups = [];
+  // The owner's, in the order their groups first appear in the file
+  // (data-n: the top-right ones come first in the page).
+  const own = [...document.querySelectorAll(".ub")].sort((a, b) => a.dataset.n - b.dataset.n);
+  for (const b of own) {
+    if (!ok(b)) continue;
+    const name = b.dataset.g || "APPS";
+    let g = groups.find(x => x.name === name);
+    if (!g) groups.push(g = {name, items: []});
+    g.items.push(b);
+  }
+  for (const [name, sel] of GROUPS) {
+    const items = [...document.querySelectorAll(sel)].filter(ok);
+    if (items.length) groups.push({name, items});
+  }
+  return groups;
+}
+const TAU = 2 * Math.PI;
+function sectorPath(c, ri, ro, a0, a1) {
+  const p = (r, a) => (c + r * Math.cos(a)).toFixed(1) + " " + (c + r * Math.sin(a)).toFixed(1);
+  const big = a1 - a0 > Math.PI ? 1 : 0;
+  return `M${p(ro, a0)}A${ro} ${ro} 0 ${big} 1 ${p(ro, a1)}L${p(ri, a1)}A${ri} ${ri} 0 ${big} 0 ${p(ri, a0)}Z`;
+}
+function svgEl(name, attrs, text) {
+  const el = document.createElementNS("http://www.w3.org/2000/svg", name);
+  for (const k in attrs) el.setAttribute(k, attrs[k]);
+  if (text !== undefined) el.textContent = text;
+  return el;
+}
+// The fan of group g's actions: each 40 degrees, 300 at most together,
+// centred on the group's own angle.
+function fanOf(w, g) {
+  const n = w.groups[g].items.length, step = Math.min(TAU / 9, TAU * 5 / 6 / n);
+  const mid = -Math.PI / 2 + TAU * (g + 0.5) / w.groups.length;
+  return {step, a0: mid - step * n / 2};
 }
 function showWheel(x, y) {
+  const groups = wheelGroups();
+  if (!groups.length) return;
+  const R = Math.max(150, Math.min(260, Math.min(innerWidth, innerHeight) * 0.24));
+  const w = wheelOn = {groups, R, r0: R * 0.2, r1: R * 0.58, ox: x, oy: y, g: -1, a: -1, frozen: false,
+                       cx: Math.min(Math.max(x, R + 8), innerWidth - R - 8),
+                       cy: Math.min(Math.max(y, R + 8), innerHeight - R - 8)};
   wheel.textContent = "";
-  const bs = wheelButtons(), n = bs.length, outer = n > 12 ? Math.ceil(n * 0.6) : n;
-  const r = Math.max(60, Math.min(Math.max(90, outer * 64 / (2 * Math.PI)),
-                                  Math.min(innerWidth, innerHeight) / 2 - 30));
-  x = Math.min(Math.max(x, r + 40), innerWidth - r - 40);
-  y = Math.min(Math.max(y, r + 24), innerHeight - r - 24);
-  bs.forEach((b, i) => {
-    // Beyond 12, the rest on an inner ring, between the outer's.
-    const inner = i >= outer, m = inner ? n - outer : outer, j = inner ? i - outer : i;
-    const a = 2 * Math.PI * j / m - Math.PI / 2 + (inner ? Math.PI / m : 0), rr = inner ? r * 0.55 : r;
-    const w = document.createElement("button");
-    w.textContent = b.textContent;
-    w.classList.toggle("held", b.classList.contains("held"));
-    w.style.left = x + rr * Math.cos(a) + "px";
-    w.style.top = y + rr * Math.sin(a) + "px";
-    w.addEventListener("mousedown", e => e.preventDefault());   // the LKB stays as it is
-    w.onclick = e => {
-      e.stopPropagation();
-      if (b === bk) kbWasOpen = document.activeElement === k;
-      b.click();
-      setTimeout(hideWheel, 300);
-    };
-    wheel.appendChild(w);
+  const svg = svgEl("svg", {width: 2 * R + 2, height: 2 * R + 2});
+  svg.style.left = w.cx - R - 1 + "px"; svg.style.top = w.cy - R - 1 + "px";
+  svg.style.fontSize = Math.round(R / 13) + "px";       // 14 px at the smallest, 20 on a car's screen
+  const c = R + 1, n = groups.length;
+  w.inner = groups.map((g, i) => {
+    const a0 = -Math.PI / 2 + TAU * i / n, a1 = a0 + TAU / n, am = (a0 + a1) / 2, rm = (w.r0 + w.r1) / 2;
+    const path = svgEl("path", {d: sectorPath(c, w.r0, w.r1, a0, a1)});
+    const text = svgEl("text", {x: c + rm * Math.cos(am), y: c + rm * Math.sin(am)}, g.name);
+    svg.append(path, text);
+    return {path, text};
   });
+  w.fan = svgEl("g", {});
+  w.mid = svgEl("text", {x: c, y: c, class: "mid", "font-size": Math.round(R / 11)}, "");
+  w.mark = svgEl("circle", {cx: c, cy: c, r: 5, class: "mark"});
+  svg.append(w.fan, w.mid, w.mark);
+  wheel.appendChild(svg);
   wheel.style.display = "block";
-  log({ev: "wheel", n});
+  log({ev: "wheel", n: groups.reduce((s, g) => s + g.items.length, 0), groups: n});
 }
-function hideWheel() { wheel.style.display = "none"; wheel.textContent = ""; }
+// The outer ring for group g: its actions, each a sector, the states
+// held (as on the bars) kept.
+function drawFan(w) {
+  w.fan.textContent = "";
+  w.outer = [];
+  if (w.g < 0) return;
+  const c = w.R + 1, {step, a0} = fanOf(w, w.g), ri = w.r1 + 4, rm = (ri + w.R) / 2;
+  w.groups[w.g].items.forEach((b, i) => {
+    const s0 = a0 + step * i, s1 = s0 + step, am = (s0 + s1) / 2;
+    const path = svgEl("path", {d: sectorPath(c, ri, w.R, s0, s1)});
+    path.classList.toggle("held", b.classList.contains("held"));
+    const text = svgEl("text", {x: c + rm * Math.cos(am), y: c + rm * Math.sin(am)}, b.textContent);
+    w.fan.append(path, text);
+    w.outer.push({path, text});
+  });
+}
+// Where the fingers point, from their start: the dead zone, a group on
+// the inner ring, or an action on the outer one.  Beyond the inner ring
+// with no group yet (a fast move), the group at that angle.
+function aimWheel(x, y) {
+  const w = wheelOn;
+  if (!w || w.frozen) return;
+  const dx = x - w.ox, dy = y - w.oy, d = Math.hypot(dx, dy);
+  const ang = Math.atan2(dy, dx), n = w.groups.length;
+  const sectorAt = a => Math.floor((((a + Math.PI / 2) % TAU + TAU) % TAU) / (TAU / n));
+  let g = w.g, a = -1;
+  if (d >= w.r0 && d < w.r1) g = sectorAt(ang);
+  else if (d >= w.r1) {
+    if (g < 0) g = sectorAt(ang);
+    const f = fanOf(w, g), m = w.groups[g].items.length;
+    let rel = ang - f.a0;
+    rel = ((rel % TAU) + TAU) % TAU;
+    if (rel < f.step * m) a = Math.floor(rel / f.step);
+  }
+  const c = w.R + 1, lim = w.R + 20, k = d > lim ? lim / d : 1;
+  w.mark.setAttribute("cx", c + dx * k); w.mark.setAttribute("cy", c + dy * k);
+  if (g !== w.g) {
+    w.inner.forEach((s, i) => { s.path.classList.toggle("aim", i === g); s.text.classList.toggle("aim", i === g); });
+    w.g = g; drawFan(w);
+  }
+  if (a !== w.a) {
+    w.outer.forEach((s, i) => { s.path.classList.toggle("aim", i === a); s.text.classList.toggle("aim", i === a); });
+    w.a = a;
+  }
+  w.mid.textContent = a >= 0 ? w.groups[g].items[a].textContent : g >= 0 && d >= w.r0 ? w.groups[g].name : "";
+}
+// The fingers all lifted: the action aimed at, if one, then away.
+function pickWheel() {
+  const w = wheelOn;
+  if (!w) return;
+  const b = w.g >= 0 && w.a >= 0 ? w.groups[w.g].items[w.a] : null;
+  hideWheel();
+  if (!b) { log({ev: "wheel-off"}); return; }
+  log({ev: "wheel-pick", label: b.textContent});
+  if (b === bk) kbWasOpen = document.activeElement === k;
+  b.click();
+}
+function hideWheel() { wheelOn = null; wheel.style.display = "none"; wheel.textContent = ""; }
 wheel.onclick = e => { if (e.target === wheel) hideWheel(); };
 let triple = false;
 function press(e) {
@@ -1581,7 +1698,7 @@ function move(e) {
   if (!active.has(e.pointerId)) return;
   e.preventDefault();
   active.set(e.pointerId, e);
-  if (triple) return;
+  if (triple) { if (wheelOn) { const p = centre(); aimWheel(p.x, p.y); } return; }
   if (cfg.input === "touch") {
     const n = norm(e);
     send({t: "tmove", id: e.pointerId, x: n.x, y: n.y});
@@ -1629,9 +1746,11 @@ function release(e) {
   if (!active.has(e.pointerId)) return;
   active.delete(e.pointerId);
   if (triple) {
+    if (wheelOn) wheelOn.frozen = true;
     if (active.size === 0) {
       triple = false; padLast = null; scrollAt = null; padHeld = false;
       if (wheelTimer) { clearTimeout(wheelTimer); wheelTimer = null; cfg.folded = !cfg.folded; save(); showFold(); }
+      else pickWheel();
     }
     return;
   }
