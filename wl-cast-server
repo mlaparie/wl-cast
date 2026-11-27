@@ -2963,7 +2963,7 @@ class Screencast(Producer):
         self.holding = False
         self.proc = subprocess.Popen(
             [SCREENCAST, "-o", output, "-s", size.split("@")[0], "-r", str(self.fps),
-             "-b", str(int(mbps * 1e6)), "-c", CODEC]
+             "-b", str(int(mbps * 1e6)), "-c", CODEC, "-m", RATE_MODE]
             + (["-D"] if self._steady else []),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.running = True
@@ -3123,6 +3123,9 @@ class Screencast(Producer):
 _sc = os.environ.get("WL_CAST_SCREENCAST", "1")
 SCREENCAST = (None if _sc == "0" else _sc if os.path.isfile(_sc)
               else shutil.which("wl-cast-capture"))
+# The helper's rate control, WL_CAST_RC: cbr (constant, the default), or
+# vbr (variable, the rate asked as its peak).
+RATE_MODE = "vbr" if os.environ.get("WL_CAST_RC") == "vbr" else "cbr"
 
 
 producer = None

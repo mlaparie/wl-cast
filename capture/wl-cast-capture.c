@@ -1,7 +1,7 @@
 /* wl-cast-capture — the screen to H.264 with no CPU copy of a pixel.
  *
  *   wl-cast-capture [-o OUTPUT] [-s WxH] [-r FPS] [-b BITRATE] [-g GOP]
- *                    [-c h264|hevc] [-D] [-t TURN] [-n FRAMES]
+ *                    [-c h264|hevc] [-m cbr|vbr] [-D] [-t TURN] [-n FRAMES]
  *
  * As scrcpy does on Android (the encoder's input surface), but on Sway:
  *   1. Sway copies the output into a GPU buffer of ours (wlr-screencopy,
@@ -20,8 +20,9 @@
  * rate whether the screen changed or not, -D from the start), s on change
  * only (the default), q quit.
  *
- * Defaults: the first output, 1600x800, 20 fps, 2 Mbit/s constant, a keyframe
- * every 10 s, the turn of the output (0, 90, 180 or 270; -t overrides).
+ * Defaults: the first output, 1600x800, 20 fps, 2 Mbit/s constant (-m vbr:
+ * variable, at most that), a keyframe every 10 s, the turn of the output
+ * (0, 90, 180 or 270; -t overrides).
  * -c hevc: HEVC (Main, level 4) in place of H.264 (constrained baseline,
  * level 4); its parameter sets (VPS, SPS, PPS) likewise only before the
  * first keyframe.
@@ -84,7 +85,7 @@ static uint64_t now_us(clockid_t clk)
 /* ---- options ---- */
 static const char *want_output;  /* NULL: the first output */
 static int W = 1600, H = 800, FPS = 20, BITRATE = 2000000, GOP_S = 10;
-static bool HEVC;
+static bool HEVC, VBR;
 static int TURN = -1;           /* -1: the output's own */
 static long FRAMES = 0;
 
@@ -394,9 +395,14 @@ static void venus_setup(void)
 	xioctl(enc, VIDIOC_S_PARM, &parm);
 
 	/* Set once, before streaming: changed on a running encoder they
-	 * killed its firmware (2026-11-19). */
-	ctrl(V4L2_CID_MPEG_VIDEO_BITRATE_MODE, V4L2_MPEG_VIDEO_BITRATE_MODE_CBR, "bitrate mode");
+	 * killed its firmware (2026-11-19).
+	 * -m vbr: a variable rate under the rate asked, which is set as the
+	 * peak (left unset, Venus takes twice the rate). */
+	ctrl(V4L2_CID_MPEG_VIDEO_BITRATE_MODE, VBR ? V4L2_MPEG_VIDEO_BITRATE_MODE_VBR
+	     : V4L2_MPEG_VIDEO_BITRATE_MODE_CBR, "bitrate mode");
 	ctrl(V4L2_CID_MPEG_VIDEO_BITRATE, BITRATE, "bitrate");
+	if (VBR)
+		ctrl(V4L2_CID_MPEG_VIDEO_BITRATE_PEAK, BITRATE, "peak bitrate");
 	ctrl(V4L2_CID_MPEG_VIDEO_GOP_SIZE, GOP_S * FPS, "gop");
 	if (HEVC) {
 		ctrl(V4L2_CID_MPEG_VIDEO_HEVC_PROFILE, V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN, "profile");
@@ -767,7 +773,7 @@ static void command(void)
 int main(int argc, char **argv)
 {
 	int opt;
-	while ((opt = getopt(argc, argv, "o:s:r:b:g:c:Dt:n:")) != -1) {
+	while ((opt = getopt(argc, argv, "o:s:r:b:g:c:m:Dt:n:")) != -1) {
 		switch (opt) {
 		case 'o': want_output = optarg; break;
 		case 's': if (sscanf(optarg, "%dx%d", &W, &H) != 2) fail("-s WxH"); break;
@@ -775,11 +781,12 @@ int main(int argc, char **argv)
 		case 'b': BITRATE = atoi(optarg); break;
 		case 'g': GOP_S = atoi(optarg); break;
 		case 'c': HEVC = !strcmp(optarg, "hevc"); break;
+		case 'm': VBR = !strcmp(optarg, "vbr"); break;
 		case 'D': steady = true; break;
 		case 't': TURN = atoi(optarg); break;
 		case 'n': FRAMES = atol(optarg); break;
 		default: fail("usage: wl-cast-capture [-o OUTPUT] [-s WxH] [-r FPS] "
-			      "[-b BITRATE] [-g GOP_S] [-c h264|hevc] [-D] "
+			      "[-b BITRATE] [-g GOP_S] [-c h264|hevc] [-m cbr|vbr] [-D] "
 			      "[-t TURN] [-n FRAMES]");
 		}
 	}
