@@ -399,10 +399,17 @@ const withKey = path =>
 // for the encoder, the GPU, the server and the Wi-Fi, and what Tesor
 // streams to cars by default (2026-11-27).
 const cfg = Object.assign({smooth: 50, av: 0, rate: 5, fps: 15, heat: 70, sound: true, input: "touch", steady: false, sync: false, adaptive: true, wifi_awake: true,
-                           canvas: false, direct: false, folded: false, low: false}, store.get("settings", {}));
+                           canvas: false, direct: false, auto: true, folded: false, low: false}, store.get("settings", {}));
+// auto: the page picks DIRECT (the frames by WebSocket, decoded by
+// WebCodecs, drawn at once: Tesor's way to a car's browser, and less work
+// on the phone than RTP) wherever the browser has WebCodecs, which needs
+// HTTPS, and VIDEO (WebRTC) elsewhere; chosen at each connection, so a
+// tab that fell back tries again next time.  The mode button or ?mode=
+// turn auto off and choose by hand.
 if (P.get("mode")) {
   cfg.canvas = P.get("mode") === "canvas";
   cfg.direct = P.get("mode") === "direct";
+  cfg.auto = false;
 }
 // Settings kept before the touchpad mode had touch true or false.
 if (cfg.touch === false && !store.get("settings", {}).input) cfg.input = "mouse";
@@ -562,6 +569,7 @@ document.getElementById("bm").onclick = async () => {
     if (cfg.direct) try { sessionStorage.removeItem("nodirect"); } catch (x) {}
   }
   else cfg.canvas = true;
+  cfg.auto = false;
   save(); showMode(); log({ev: "mode", canvas: cfg.canvas, direct: cfg.direct});
   // DIRECT in or out: a new connection, the phone sending the other way.
   if (cfg.direct !== was) {
@@ -1082,6 +1090,13 @@ async function connect() {
   // HEVC from the phone: over WebRTC if this browser lists it, by
   // WebCodecs in DIRECT if it decodes it; else H.264, set on the phone
   // (it starts again) and said here.
+  // The transport, before the codec check that depends on it: DIRECT
+  // where this browser decodes by WebCodecs (HTTPS), else VIDEO.
+  if (cfg.auto) {
+    const direct = directOk();
+    if (direct !== cfg.direct) { cfg.direct = direct; if (direct) cfg.canvas = false; showMode(); }
+  }
+  log({ev: "transport", direct: cfg.direct, auto: cfg.auto, secure: isSecureContext});
   if (phone.codec === "hevc") {
     let ok;
     if (cfg.direct && directOk()) {
