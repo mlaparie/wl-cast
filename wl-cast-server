@@ -2952,7 +2952,7 @@ class Screencast(Producer):
         self.adaptive = kept_setting("adaptive", True)
         self.paused = False
         self.calm = 0
-        self.steady = False
+        self._steady = bool(kept_setting("steady", False))
         self.pushed_at = 0.0
         self.size = size
         self.keyframes = None
@@ -2963,7 +2963,8 @@ class Screencast(Producer):
         self.holding = False
         self.proc = subprocess.Popen(
             [SCREENCAST, "-o", output, "-s", size.split("@")[0], "-r", str(self.fps),
-             "-b", str(int(mbps * 1e6)), "-c", CODEC],
+             "-b", str(int(mbps * 1e6)), "-c", CODEC]
+            + (["-D"] if self._steady else []),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.running = True
         threading.Thread(target=self.read, daemon=True).start()
@@ -2978,6 +2979,18 @@ class Screencast(Producer):
             self.proc.stdin.flush()
         except (OSError, ValueError):
             pass
+
+    # The page's "steady" (SET): the helper copies a frame at the rate
+    # whether the screen changed or not, as Producer's clock does; else
+    # only on change.
+    @property
+    def steady(self):
+        return self._steady
+
+    @steady.setter
+    def steady(self, on):
+        self._steady = bool(on)
+        self.tell(b"S" if on else b"s")
 
     def errors(self):
         for line in self.proc.stderr:
