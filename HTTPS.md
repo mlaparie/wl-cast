@@ -28,11 +28,14 @@ How it works, as tesla-carplay does it:
 - a Let's Encrypt certificate is made for it by certbot with a DNS
   challenge, through your DNS provider's API, and renewed when 30 days are
   left;
-- the host's hotspot sends that address to the stream's HTTPS port
-  (nftables, until the next reboot).
+- the host's hotspot sends that address, ports 443 and 8443, to the
+  stream's HTTPS port 8443 (nftables, until the next reboot).  So
+  `https://stream.example.com/` works in the car, with no port.
 
 So it only works on the host's own hotspot: on another network nothing
-sends that address to the host.
+sends that address to the host.  The hotspot may run on `wlan0` or on
+`ap0` (beside a Wi-Fi network), with whichever address NetworkManager
+gives it.
 
 ### Setting it up
 
@@ -50,12 +53,21 @@ sends that address to the host.
    PORKBUN_SECRET_KEY=sk1_...
    ```
 
-3. Run `sudo wl-cast-cert` (it needs root for certbot, the certificate
-   directory and nftables).  It prints the result.  Run it again when the
-   hotspot starts, or let your hook or distribution do it: it renews when
-   needed and is quick otherwise.
-4. Start the stream on the hotspot (`wl-cast start -v hotspot`) and open
-   `https://stream.example.com:8443/` in the car.
+3. Run `sudo wl-cast-cert` once (it needs root for certbot, the
+   certificate directory and nftables).  It prints the result; a first
+   certificate takes about two minutes.
+4. Let `wl-cast start` run it from then on: when `https.conf` names a
+   domain and the hotspot is up, it calls `sudo -n wl-cast-cert` before
+   the server starts (which is when the server reads the certificate), so
+   the redirect is back after a reboot and the certificate renewed when
+   due.  That needs sudo without a password for it, a sudoers line such as
+   `%wheel ALL=(root) NOPASSWD: /usr/bin/wl-cast-cert` (your
+   distribution's path to it), else `wl-cast start` says so and goes on
+   with the host's own certificate.  Offline (no internet on the host), a
+   certificate from before is kept and the redirect still set.
+5. Start the stream on the hotspot (`wl-cast start -v hotspot`) and open
+   `https://stream.example.com/` in the car.  `wl-cast start` prints that
+   link, with the key, before the hotspot's own.
 
 Another provider: a script `wl-cast-dns-NAME` doing what
 `dns/wl-cast-dns-porkbun` does (`a NAME ADDRESS`, and certbot's `auth` and
@@ -66,9 +78,13 @@ Another provider: a script `wl-cast-dns-NAME` doing what
 | path | what |
 |---|---|
 | `/var/lib/wl-cast/tls/cert.pem`, `key.pem` | the certificate the server serves (key readable by group users) |
-| `/var/lib/wl-cast/tls/name`, `status` | its name and the last result |
+| `/var/lib/wl-cast/tls/name`, `status` | its name (`wl-cast start` puts it in the links) and the last result |
 | `/var/lib/wl-cast/letsencrypt/` | certbot's account and certificates |
 | `/var/log/wl-cast-cert.log` | every result |
 
 With no `STREAM_DOMAIN`, wl-cast-cert removes the redirect and the server
 goes back to its own certificate.
+
+As root, wl-cast-cert needs `certbot`, `nft`, `curl` and `openssl` in its
+PATH (sudo gives a bare one); it says which is missing.  The redirect goes
+to port 8443: keep wl-cast's `-t` at its default.

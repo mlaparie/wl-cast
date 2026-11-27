@@ -23,8 +23,10 @@
 #   -t PORT      HTTPS port (8443), for browsers that refuse plain HTTP
 #                (some cars'): it uses the certificate in
 #                /var/lib/wl-cast/tls if you put one there (wl-cast-cert
-#                gets one for a domain of yours), else a self-signed one
-#                made on first use, which the browser warns about once
+#                gets one for a domain of yours, and start runs it when
+#                ~/.config/wl-cast/https.conf names one and the hotspot
+#                is up: HTTPS.md), else a self-signed one made on first
+#                use, which the browser warns about once
 #   -k KEY       the key the link carries; -k '' for none.  Default: a random
 #                one, kept between runs so that a bookmark keeps working
 #   -f FPS       frame rate (30)
@@ -218,8 +220,8 @@ pick_output() {
 # Every address a viewer can open the stream on, "ADDRESS<TAB>INTERFACE",
 # the default route's first: each network the host is on, its VPN
 # (Tailscale) and USB networking included, not loopback, containers,
-# bridges or mobile data (the carrier lets nobody in).  With -v hotspot, only the hotspot's (10.42.0.x, NetworkManager's
-# shared network): the server refuses the rest.
+# bridges or mobile data (the carrier lets nobody in).  With -v hotspot, only the hotspot's (10.42.x.y, NetworkManager's
+# shared networks): the server refuses the rest.
 addresses() {
     def=$(ip -4 route get 1.1.1.1 2>/dev/null |
               awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }')
@@ -228,10 +230,30 @@ addresses() {
             $2 ~ /^(lo|waydroid|veth|docker|br-|virbr|lxc)/ { next }
             $2 ~ /^(rmnet|qmapmux|wwan|ccmni)/ { next }  # mobile data: behind the carrier
             { sub("/.*", "", $4) }
-            hot == "hotspot" && $4 !~ /^10\.42\.0\./ { next }
+            hot == "hotspot" && $4 !~ /^10\.42\./ { next }
             hot == "usb" && $2 !~ /^(usb|rndis|ncm)/ { next }
             { print ($4 == def ? 0 : 1) "\t" $4 "\t" $2 }' |
         sort -s -k1,1 | cut -f2-
+}
+
+# The HTTPS name on the hotspot (wl-cast-cert, HTTPS.md): when the user's
+# settings name a domain and the hotspot is among the addresses, its
+# certificate and the hotspot's redirect are checked through sudo without
+# a password (a sudoers line of yours or your distribution's), before the
+# server starts, since it reads the certificate then.  The result goes to
+# stderr; a first certificate takes about two minutes.  Prints the name
+# when it is set, for the links.
+https_name() {                  # https_name ADDRS
+    conf=${XDG_CONFIG_HOME:-$HOME/.config}/wl-cast/https.conf
+    grep -qE '^[[:space:]]*STREAM_DOMAIN=[[:space:]]*["'"'"']?[a-z0-9]' "$conf" 2>/dev/null || return 0
+    printf '%s\n' "$1" | grep -q "^10\.42\." || return 0
+    cert=$(command -v wl-cast-cert) || { echo "wl-cast: HTTPS name: wl-cast-cert not found" >&2; return 0; }
+    result=$(timeout 300 sudo -n "$cert" 2>&1 | tail -1)
+    case "$result" in
+        "sudo: "*) echo "wl-cast: HTTPS name: $result (allow sudo $cert without a password, or run it yourself)" >&2 ;;
+        *) echo "wl-cast: HTTPS name: ${result:-wl-cast-cert said nothing}" >&2 ;;
+    esac
+    cat /var/lib/wl-cast/tls/name 2>/dev/null
 }
 
 # Tailscale Funnel: its public name, and what it still needs, one line
@@ -290,6 +312,7 @@ start() {
     if [ -n "$addr" ]; then addrs=$(printf '%s\tgiven\n' "$addr")
     else addrs=$(addresses "$who"); fi
     [ -n "$addrs" ] || { echo "wl-cast: no network${who:+ for -v $who}" >&2; exit 1; }
+    name=$(https_name "$addrs")
 
     # The output's size in pixels, even, its long side at most 1920 or the
     # size last chosen on the page (or -l).
@@ -327,9 +350,12 @@ start() {
         echo "wl-cast: Funnel did not start; local links only" >&2
     fi
     # Every link for these settings, one a line with where it works:
-    # Funnel's public one first, then HTTP and HTTPS on each address.
+    # Funnel's public one first, then HTTP and HTTPS on each address, the
+    # HTTPS name before the hotspot's own (the car opens it with no port:
+    # the hotspot sends its 443 to the stream).
     { [ -n "$public" ] && printf 'https://%s/%s\tpublic\n' "$public" "${key:+?k=$key}"
       printf '%s\n' "$addrs" | while IFS="$(printf '\t')" read -r a dev; do
+          case "$a" in 10.42.*) [ -n "$name" ] && printf 'https://%s/%s\t%s\n' "$name" "${key:+?k=$key}" "$dev" ;; esac
           printf 'http://%s:%s/%s\t%s\nhttps://%s:%s/%s\t%s\n' "$a" "$port" "${key:+?k=$key}" "$dev" \
                  "$a" "$tls" "${key:+?k=$key}" "$dev"
       done; } | tee "$links_file"
