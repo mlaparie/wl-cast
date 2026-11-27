@@ -407,11 +407,21 @@ function vp8IfNothing(pc, reload) {
 }
 const withKey = path =>
   key ? path + (path.includes("?") ? "&" : "?") + "k=" + encodeURIComponent(key) : path;
-const cfg = Object.assign({smooth: 50, av: 0, rate: 6, fps: 30, heat: 70, sound: true, input: "touch", steady: false, sync: false, adaptive: true, wifi_awake: true,
-                           canvas: false, direct: false, folded: false, low: false}, store.get("settings", {}));
+// 15 fps and 5 Mbit/s unless chosen (SET, -f, -b): half the frames of 30
+// for the encoder, the GPU, the server and the Wi-Fi, and what Tesor
+// streams to cars by default (2026-11-27).
+const cfg = Object.assign({smooth: 50, av: 0, rate: 5, fps: 15, heat: 70, sound: true, input: "touch", steady: false, sync: false, adaptive: true, wifi_awake: true,
+                           canvas: false, direct: false, auto: true, folded: false, low: false}, store.get("settings", {}));
+// auto: the page picks DIRECT (the frames by WebSocket, decoded by
+// WebCodecs, drawn at once: Tesor's way to a car's browser, and less work
+// on the phone than RTP) wherever the browser has WebCodecs, which needs
+// HTTPS, and VIDEO (WebRTC) elsewhere; chosen at each connection, so a
+// tab that fell back tries again next time.  The mode button or ?mode=
+// turn auto off and choose by hand.
 if (P.get("mode")) {
   cfg.canvas = P.get("mode") === "canvas";
   cfg.direct = P.get("mode") === "direct";
+  cfg.auto = false;
 }
 // Settings kept before the touchpad mode had touch true or false.
 if (cfg.touch === false && !store.get("settings", {}).input) cfg.input = "mouse";
@@ -571,6 +581,7 @@ document.getElementById("bm").onclick = async () => {
     if (cfg.direct) try { sessionStorage.removeItem("nodirect"); } catch (x) {}
   }
   else cfg.canvas = true;
+  cfg.auto = false;
   save(); showMode(); log({ev: "mode", canvas: cfg.canvas, direct: cfg.direct});
   // DIRECT in or out: a new connection, the phone sending the other way.
   if (cfg.direct !== was) {
@@ -1091,6 +1102,13 @@ async function connect() {
   // HEVC from the phone: over WebRTC if this browser lists it, by
   // WebCodecs in DIRECT if it decodes it; else H.264, set on the phone
   // (it starts again) and said here.
+  // The transport, before the codec check that depends on it: DIRECT
+  // where this browser decodes by WebCodecs (HTTPS), else VIDEO.
+  if (cfg.auto) {
+    const direct = directOk();
+    if (direct !== cfg.direct) { cfg.direct = direct; if (direct) cfg.canvas = false; showMode(); }
+  }
+  log({ev: "transport", direct: cfg.direct, auto: cfg.auto, secure: isSecureContext});
   if (phone.codec === "hevc") {
     let ok;
     if (cfg.direct && directOk()) {
@@ -2206,8 +2224,10 @@ class Screen:
         # Upright and unscaled whatever the panel's settings, and a custom
         # mode at 60 Hz: with "resolution" Sway gave it a refresh of 0, it
         # never redrew, and the capture's first frame never came, which
-        # held the portal's capture for good (2026-11-19).
-        for command in (f"output {self.name} transform normal scale 1",
+        # held the portal's capture for good (2026-11-19).  Powered on
+        # first: born off, it ignored the mode (2026-11-27).
+        for command in (f"output {self.name} power on",
+                        f"output {self.name} transform normal scale 1",
                         f"output {self.name} mode --custom {width}x{height}@60Hz "
                         f"position {right} 0"):
             subprocess.run(["swaymsg", "--", command], capture_output=True, timeout=5)
@@ -3071,7 +3091,7 @@ class Screencast(Producer):
         self.adaptive = kept_setting("adaptive", True)
         self.paused = False
         self.calm = 0
-        self.steady = False
+        self._steady = bool(kept_setting("steady", False))
         self.pushed_at = 0.0
         self.size = size
         self.keyframes = None
@@ -3082,7 +3102,8 @@ class Screencast(Producer):
         self.holding = False
         self.proc = subprocess.Popen(
             [SCREENCAST, "-o", output, "-s", size.split("@")[0], "-r", str(self.fps),
-             "-b", str(int(mbps * 1e6)), "-c", CODEC],
+             "-b", str(int(mbps * 1e6)), "-c", CODEC, "-m", RATE_MODE]
+            + (["-D"] if self._steady else []),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.running = True
         threading.Thread(target=self.read, daemon=True).start()
@@ -3097,6 +3118,18 @@ class Screencast(Producer):
             self.proc.stdin.flush()
         except (OSError, ValueError):
             pass
+
+    # The page's "steady" (SET): the helper copies a frame at the rate
+    # whether the screen changed or not, as Producer's clock does; else
+    # only on change.
+    @property
+    def steady(self):
+        return self._steady
+
+    @steady.setter
+    def steady(self, on):
+        self._steady = bool(on)
+        self.tell(b"S" if on else b"s")
 
     def errors(self):
         for line in self.proc.stderr:
@@ -3229,6 +3262,9 @@ class Screencast(Producer):
 _sc = os.environ.get("WL_CAST_SCREENCAST", "1")
 SCREENCAST = (None if _sc == "0" else _sc if os.path.isfile(_sc)
               else shutil.which("wl-cast-capture"))
+# The helper's rate control, WL_CAST_RC: cbr (constant, the default), or
+# vbr (variable, the rate asked as its peak).
+RATE_MODE = "vbr" if os.environ.get("WL_CAST_RC") == "vbr" else "cbr"
 
 
 producer = None
@@ -3252,18 +3288,23 @@ def video_parse():
 # The sound: what the phone plays (the default output's monitor, through
 # PipeWire's PulseAudio server), as Opus.  Blocks of 10 ms in a 40 ms buffer
 # underran, heard as buzzing and crackling (author, 2026-11-18): 20 ms blocks
-# in a 200 ms buffer, and 20 ms Opus frames, Opus's usual.  Some crackling
+# in a 200 ms buffer, and 20 ms Opus frames, Opus's usual; then 40 ms
+# blocks, two Opus frames each: every block wakes pipewire-pulse, PipeWire
+# and this process, and 20 ms blocks cost 4% of a core in each of the two
+# daemons, 40 ms blocks half of that (2026-11-27).  Some crackling
 # stayed: the source follows the pipeline's clock by retimestamping, not by
 # dropping or repeating samples (slave-method's default, skew, clicks).
 # 96 kbit/s with in-band FEC: cheaper on Wi-Fi, and a lost packet is rebuilt
-# from the next one rather than concealed.
+# from the next one rather than concealed.  Complexity 5 of 10: Opus's
+# search effort, most of the encoder's CPU, for a difference in quality
+# that 96 kbit/s does not show (Tesor sends raw PCM for the same reason).
 # WL_CAST_SOUND: another source, Stream viewer's monitor (wl-cast).
 AUDIO = (
     f"pulsesrc name=asrc device={os.environ.get('WL_CAST_SOUND') or '@DEFAULT_MONITOR@'} "
-    "buffer-time=200000 latency-time=20000 "
+    "buffer-time=200000 latency-time=40000 "
     "slave-method=re-timestamp ! valve name=av ! "
     "audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! "
-    "opusenc bitrate=96000 frame-size=20 inband-fec=true packet-loss-percentage=5 ! "
+    "opusenc bitrate=96000 frame-size=20 complexity=5 inband-fec=true packet-loss-percentage=5 ! "
     "rtpopuspay pt=97 mtu=1200 ! "
     "application/x-rtp,media=audio,encoding-name=OPUS,payload=97"
 )
@@ -4557,7 +4598,7 @@ class Handler(BaseHTTPRequestHandler):
     size = ""
     target = 0        # the capture rate chosen (the heat limit may hold it lower)
     key = ""          # --key: every request carries it as ?k=
-    mbps = 6.0        # the encoder's bit rate, from the page
+    mbps = 5.0        # the encoder's bit rate, from the page (SET), else 5
 
     # --visibility hotspot: only the phone's hotspot (and the phone itself);
     # usb: only a computer on a USB cable (USB networking), and the host.

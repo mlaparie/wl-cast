@@ -1,7 +1,7 @@
 /* wl-cast-capture — the screen to H.264 with no CPU copy of a pixel.
  *
  *   wl-cast-capture [-o OUTPUT] [-s WxH] [-r FPS] [-b BITRATE] [-g GOP]
- *                    [-c h264|hevc] [-t TURN] [-n FRAMES]
+ *                    [-c h264|hevc] [-m cbr|vbr] [-D] [-t TURN] [-n FRAMES]
  *
  * As scrcpy does on Android (the encoder's input surface), but on Sway:
  *   1. Sway copies the output into a GPU buffer of ours (wlr-screencopy,
@@ -16,10 +16,13 @@
  *      bytes (SPS and PPS only before the first keyframe: Venus does not
  *      repeat them, the reader keeps them).
  * stdin, one byte each: k a keyframe, h hold (no new frames for the
- * encoder: the network is behind), g go again, q quit.
+ * encoder: the network is behind), g go again, S steady (a frame at the
+ * rate whether the screen changed or not, -D from the start), s on change
+ * only (the default), q quit.
  *
- * Defaults: the first output, 1600x800, 20 fps, 2 Mbit/s constant, a keyframe
- * every 10 s, the turn of the output (0, 90, 180 or 270; -t overrides).
+ * Defaults: the first output, 1600x800, 20 fps, 2 Mbit/s constant (-m vbr:
+ * variable, at most that), a keyframe every 10 s, the turn of the output
+ * (0, 90, 180 or 270; -t overrides).
  * -c hevc: HEVC (Main, level 4) in place of H.264 (constrained baseline,
  * level 4); its parameter sets (VPS, SPS, PPS) likewise only before the
  * first keyframe.
@@ -82,7 +85,7 @@ static uint64_t now_us(clockid_t clk)
 /* ---- options ---- */
 static const char *want_output;  /* NULL: the first output */
 static int W = 1600, H = 800, FPS = 20, BITRATE = 2000000, GOP_S = 10;
-static bool HEVC;
+static bool HEVC, VBR;
 static int TURN = -1;           /* -1: the output's own */
 static long FRAMES = 0;
 
@@ -127,11 +130,19 @@ static void output_mode(void *d, struct wl_output *o, uint32_t f, int32_t w,
 static void output_done(void *d, struct wl_output *o) { (void)d; (void)o; }
 static void output_scale(void *d, struct wl_output *o, int32_t s) { (void)d; (void)o; (void)s; }
 static struct wl_output *candidate;
+/* A headless output (a screen of the stream's own, wl-cast-screen) draws
+ * only when asked: on damage alone it gave about one frame a second from
+ * a 30 fps video (swayfx 0.6, 2026-11-27), and its clients drew at that
+ * pace too.  Its frames are asked for at the rate, changed or not, like
+ * steady. */
+static bool headless;
+
 static void output_name(void *d, struct wl_output *o, const char *name)
 {
 	if (want_output ? !strcmp(name, want_output) : !output) {
 		output = o;
 		output_transform = *(int *)d;
+		headless = !strncmp(name, "HEADLESS", 8);
 	}
 }
 static void output_description(void *d, struct wl_output *o, const char *s) { (void)d; (void)o; (void)s; }
@@ -164,7 +175,7 @@ static EGLContext ctx;
 static PFNEGLCREATEIMAGEKHRPROC create_image;
 static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC image_target;
 static GLuint prog_y, prog_uv, vbo;
-static GLint uni_turn_y, uni_turn_uv, uni_flip_y, uni_flip_uv, uni_px_uv;
+static GLint uni_turn_y, uni_turn_uv, uni_flip_y, uni_flip_uv;
 
 static GLuint shader(GLenum type, const char *src)
 {
@@ -211,11 +222,15 @@ static const char *vertex_src =
 static const char *y_src = SAMPLE
 	"void main() { vec3 c = at(uv);\n"
 	"  gl_FragColor = vec4(dot(c, vec3(0.1826, 0.6142, 0.0620)) + 0.0625, 0.0, 0.0, 1.0); }\n";
+/* One bilinear tap at the centre of the 2x2 block of stream pixels: the
+ * texture's own filter averages the four source texels around it, where
+ * the first version took four taps, each itself bilinear (16 texels read
+ * for every chroma sample; the UV pass cost as much as the Y pass).  At
+ * the stream's own size this is the block's exact mean; scaled down, the
+ * middle of the block. */
 static const char *uv_src = SAMPLE
-	"uniform vec2 px;\n"     /* one stream pixel, in uv */
 	"void main() {\n"
-	"  vec3 c = 0.25 * (at(uv + vec2(-0.5, -0.5) * px) + at(uv + vec2(0.5, -0.5) * px)\n"
-	"                 + at(uv + vec2(-0.5, 0.5) * px) + at(uv + vec2(0.5, 0.5) * px));\n"
+	"  vec3 c = at(uv);\n"
 	"  float u = dot(c, vec3(-0.1006, -0.3386, 0.4392)) + 0.5;\n"
 	"  float v = dot(c, vec3(0.4392, -0.3989, -0.0403)) + 0.5;\n"
 	"  gl_FragColor = vec4(u, v, 0.0, 1.0); }\n";
@@ -260,7 +275,6 @@ static void gl_setup(void)
 	image_target = (void *)eglGetProcAddress("glEGLImageTargetTexture2DOES");
 	prog_y = program(y_src, &uni_turn_y, &uni_flip_y);
 	prog_uv = program(uv_src, &uni_turn_uv, &uni_flip_uv);
-	uni_px_uv = glGetUniformLocation(prog_uv, "px");
 	static const GLfloat quad[] = { -1, -1, 1, -1, -1, 1, 1, 1 };
 	glGenBuffers(1, &vbo);
 	glBindBuffer(GL_ARRAY_BUFFER, vbo);
@@ -312,6 +326,7 @@ static void *caps_map[CAPTURES];
 static size_t caps_len[CAPTURES];
 static int stride, uv_offset;
 static bool hold;
+static bool steady;             /* -D, S/s: every frame, changed or not */
 static long sent;
 static bool stdin_open = true;
 
@@ -388,9 +403,14 @@ static void venus_setup(void)
 	xioctl(enc, VIDIOC_S_PARM, &parm);
 
 	/* Set once, before streaming: changed on a running encoder they
-	 * killed its firmware (2026-11-19). */
-	ctrl(V4L2_CID_MPEG_VIDEO_BITRATE_MODE, V4L2_MPEG_VIDEO_BITRATE_MODE_CBR, "bitrate mode");
+	 * killed its firmware (2026-11-19).
+	 * -m vbr: a variable rate under the rate asked, which is set as the
+	 * peak (left unset, Venus takes twice the rate). */
+	ctrl(V4L2_CID_MPEG_VIDEO_BITRATE_MODE, VBR ? V4L2_MPEG_VIDEO_BITRATE_MODE_VBR
+	     : V4L2_MPEG_VIDEO_BITRATE_MODE_CBR, "bitrate mode");
 	ctrl(V4L2_CID_MPEG_VIDEO_BITRATE, BITRATE, "bitrate");
+	if (VBR)
+		ctrl(V4L2_CID_MPEG_VIDEO_BITRATE_PEAK, BITRATE, "peak bitrate");
 	ctrl(V4L2_CID_MPEG_VIDEO_GOP_SIZE, GOP_S * FPS, "gop");
 	if (HEVC) {
 		ctrl(V4L2_CID_MPEG_VIDEO_HEVC_PROFILE, V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN, "profile");
@@ -532,8 +552,14 @@ static void f_buffer_done(void *d, struct zwlr_screencopy_frame_v1 *f)
 	if (!shots[0].bo)
 		for (int i = 0; i < CAPS; i++)
 			shot_setup(&shots[i]);
-	/* On damage: Sway answers at its next frame that changed. */
-	zwlr_screencopy_frame_v1_copy_with_damage(f, frame_shot->buffer);
+	/* On damage: Sway answers at its next frame that changed.  Steady: at
+	 * its next frame, changed or not, which it is made to draw (a plain
+	 * copy marks the output as needing a frame; a headless output of
+	 * Sway's drew about once a second otherwise, 2026-11-27). */
+	if (steady || headless)
+		zwlr_screencopy_frame_v1_copy(f, frame_shot->buffer);
+	else
+		zwlr_screencopy_frame_v1_copy_with_damage(f, frame_shot->buffer);
 	shot_buffer_done = true;
 }
 static const struct zwlr_screencopy_frame_v1_listener frame_listener = {
@@ -548,6 +574,11 @@ static const struct zwlr_screencopy_frame_v1_listener frame_listener = {
  * still held to it.  After a failed copy, 5 ms after the request. */
 static uint64_t next_due(void)
 {
+	/* Steady: Sway answers a plain copy at its very next frame, so the
+	 * rule above would run ahead of the rate (43 fps for 30 asked,
+	 * 2026-11-27): one request a frame period. */
+	if (steady || headless)
+		return last_copy_us + frame_us;
 	uint64_t due = last_ready_us + frame_us * 6 / 10;
 	return due > last_copy_us + 5000 ? due : last_copy_us + 5000;
 }
@@ -600,6 +631,38 @@ static void draw(GLuint prog, GLint uturn, GLint uflip, struct shot *s, int turn
 
 static int64_t mono_to_real_us;
 
+/* How long each frame's conversion holds this thread on the GPU (from the
+ * first draw to glFinish's return: the two passes, and Sway's copy into the
+ * shot when it is still in the GPU's queue), median and worst every 10 s on
+ * stderr, which the server logs ("screencast: gpu ms ..."). */
+static uint64_t gpu_us[512];
+static int gpu_n;
+static uint64_t gpu_report_at;
+
+static int cmp_u64(const void *a, const void *b)
+{
+	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+	return x < y ? -1 : x > y;
+}
+
+static void gpu_sample(uint64_t us)
+{
+	uint64_t now = now_us(CLOCK_MONOTONIC);
+	if (gpu_n < (int)(sizeof gpu_us / sizeof *gpu_us))
+		gpu_us[gpu_n++] = us;
+	if (!gpu_report_at)
+		gpu_report_at = now + 10000000;
+	if (now < gpu_report_at)
+		return;
+	gpu_report_at = now + 10000000;
+	if (gpu_n) {
+		qsort(gpu_us, gpu_n, sizeof *gpu_us, cmp_u64);
+		fprintf(stderr, "wl-cast-capture: gpu ms (median/worst): %.1f/%.1f over %d frames\n",
+			gpu_us[gpu_n / 2] / 1000.0, gpu_us[gpu_n - 1] / 1000.0, gpu_n);
+	}
+	gpu_n = 0;
+}
+
 static void encode_ready(void)
 {
 	struct shot *s = NULL;
@@ -612,16 +675,16 @@ static void encode_ready(void)
 	/* The turn: the output's (its buffer is copied before it), unless
 	 * given.  wl_output's 90 is a turn of the content counterclockwise. */
 	int turn = TURN >= 0 ? TURN : (output_transform & 3) * 90;
+	uint64_t t0 = now_us(CLOCK_MONOTONIC);
 	glBindFramebuffer(GL_FRAMEBUFFER, outs[o].fb_y);
 	glViewport(0, 0, W, H);
 	draw(prog_y, uni_turn_y, uni_flip_y, s, turn);
 	glBindFramebuffer(GL_FRAMEBUFFER, outs[o].fb_uv);
 	glViewport(0, 0, W / 2, H / 2);
-	glUseProgram(prog_uv);
-	glUniform2f(uni_px_uv, 1.0f / W, 1.0f / H);
 	draw(prog_uv, uni_turn_uv, uni_flip_uv, s, turn);
 	/* V4L2 does not wait for the GPU: finished before Venus reads. */
 	glFinish();
+	gpu_sample(now_us(CLOCK_MONOTONIC) - t0);
 	s->ready = false;
 
 	struct v4l2_plane pl = { .bytesused = uv_offset + stride * (H / 2) };
@@ -708,7 +771,9 @@ static void command(void)
 		else if (c[i] == 'g') {
 			hold = false;
 			request_copy();
-		} else if (c[i] == 'q')
+		} else if (c[i] == 'S' || c[i] == 's')
+			steady = c[i] == 'S';
+		else if (c[i] == 'q')
 			exit(0);
 	}
 }
@@ -716,7 +781,7 @@ static void command(void)
 int main(int argc, char **argv)
 {
 	int opt;
-	while ((opt = getopt(argc, argv, "o:s:r:b:g:c:t:n:")) != -1) {
+	while ((opt = getopt(argc, argv, "o:s:r:b:g:c:m:Dt:n:")) != -1) {
 		switch (opt) {
 		case 'o': want_output = optarg; break;
 		case 's': if (sscanf(optarg, "%dx%d", &W, &H) != 2) fail("-s WxH"); break;
@@ -724,10 +789,13 @@ int main(int argc, char **argv)
 		case 'b': BITRATE = atoi(optarg); break;
 		case 'g': GOP_S = atoi(optarg); break;
 		case 'c': HEVC = !strcmp(optarg, "hevc"); break;
+		case 'm': VBR = !strcmp(optarg, "vbr"); break;
+		case 'D': steady = true; break;
 		case 't': TURN = atoi(optarg); break;
 		case 'n': FRAMES = atol(optarg); break;
 		default: fail("usage: wl-cast-capture [-o OUTPUT] [-s WxH] [-r FPS] "
-			      "[-b BITRATE] [-g GOP_S] [-c h264|hevc] [-t TURN] [-n FRAMES]");
+			      "[-b BITRATE] [-g GOP_S] [-c h264|hevc] [-m cbr|vbr] [-D] "
+			      "[-t TURN] [-n FRAMES]");
 		}
 	}
 	/* Gone with the server that started it, however it ends. */
@@ -749,6 +817,8 @@ int main(int argc, char **argv)
 		fail("Sway lacks wlr-screencopy or linux-dmabuf");
 	if (!output)
 		fail("no such output");
+	if (headless)
+		fprintf(stderr, "wl-cast-capture: headless output: a frame at the rate, changed or not\n");
 
 	gl_setup();
 	venus_setup();

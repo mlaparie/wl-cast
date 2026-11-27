@@ -29,7 +29,8 @@
 #                use, which the browser warns about once
 #   -k KEY       the key the link carries; -k '' for none.  Default: a random
 #                one, kept between runs so that a bookmark keeps working
-#   -f FPS       frame rate (30)
+#   -f FPS       frame rate (default: the rate last chosen on the page,
+#                else 15)
 #   -l PIXELS    the picture's long side at most (default: the size last
 #                chosen on the page, else 1920)
 #   -b MBPS      the encoder's bit rate in Mbit/s (default: the rate last
@@ -277,7 +278,13 @@ funnel_missing() {
 }
 
 start() {
-    addr= port=8081 tls=8443 fps=30 approve=off who=lan dims=
+    addr= port=8081 tls=8443 approve=off who=lan dims=
+    # The frame rate last chosen on the page (SET), else 15: half the
+    # frames of 30 for the encoder, the GPU, the server and the Wi-Fi, and
+    # what Tesor streams to cars by default; the page's setting, -f and the
+    # SET slider still choose.
+    fps=$(jq -r '.fps // empty' "$state/stream.json" 2>/dev/null)
+    case "$fps" in ''|*[!0-9]*) fps=15 ;; esac
     # The screen mode last chosen on the page (its button), unless -s.
     screen=$(cat "${XDG_STATE_HOME:-$HOME/.local/state}/wl-cast-screen" 2>/dev/null)
     case "$screen" in phone|client|multi-monitor) ;; *) screen=phone ;; esac
