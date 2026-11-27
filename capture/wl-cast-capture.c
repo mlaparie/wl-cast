@@ -130,11 +130,19 @@ static void output_mode(void *d, struct wl_output *o, uint32_t f, int32_t w,
 static void output_done(void *d, struct wl_output *o) { (void)d; (void)o; }
 static void output_scale(void *d, struct wl_output *o, int32_t s) { (void)d; (void)o; (void)s; }
 static struct wl_output *candidate;
+/* A headless output (a screen of the stream's own, wl-cast-screen) draws
+ * only when asked: on damage alone it gave about one frame a second from
+ * a 30 fps video (swayfx 0.6, 2026-11-27), and its clients drew at that
+ * pace too.  Its frames are asked for at the rate, changed or not, like
+ * steady. */
+static bool headless;
+
 static void output_name(void *d, struct wl_output *o, const char *name)
 {
 	if (want_output ? !strcmp(name, want_output) : !output) {
 		output = o;
 		output_transform = *(int *)d;
+		headless = !strncmp(name, "HEADLESS", 8);
 	}
 }
 static void output_description(void *d, struct wl_output *o, const char *s) { (void)d; (void)o; (void)s; }
@@ -548,7 +556,7 @@ static void f_buffer_done(void *d, struct zwlr_screencopy_frame_v1 *f)
 	 * its next frame, changed or not, which it is made to draw (a plain
 	 * copy marks the output as needing a frame; a headless output of
 	 * Sway's drew about once a second otherwise, 2026-11-27). */
-	if (steady)
+	if (steady || headless)
 		zwlr_screencopy_frame_v1_copy(f, frame_shot->buffer);
 	else
 		zwlr_screencopy_frame_v1_copy_with_damage(f, frame_shot->buffer);
@@ -569,7 +577,7 @@ static uint64_t next_due(void)
 	/* Steady: Sway answers a plain copy at its very next frame, so the
 	 * rule above would run ahead of the rate (43 fps for 30 asked,
 	 * 2026-11-27): one request a frame period. */
-	if (steady)
+	if (steady || headless)
 		return last_copy_us + frame_us;
 	uint64_t due = last_ready_us + frame_us * 6 / 10;
 	return due > last_copy_us + 5000 ? due : last_copy_us + 5000;
@@ -809,6 +817,8 @@ int main(int argc, char **argv)
 		fail("Sway lacks wlr-screencopy or linux-dmabuf");
 	if (!output)
 		fail("no such output");
+	if (headless)
+		fprintf(stderr, "wl-cast-capture: headless output: a frame at the rate, changed or not\n");
 
 	gl_setup();
 	venus_setup();

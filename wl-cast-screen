@@ -42,6 +42,9 @@ size() {                        # size NAME WxH [FPS]
     w=${2%x*} h=${2#*x}
     right=$(swaymsg -t get_outputs -r |
                 jq --arg n "$1" '[.[] | select(.name != $n) | .rect.x + .rect.width] | max // 0')
+    # Born powered off (swayfx 0.6, 2026-11-27): off, the mode below was
+    # ignored (1920x1080@0 stayed) and it never drew.
+    sw "output $1 power on"
     sw "output $1 transform normal scale 1"
     sw "output $1 mode --custom ${w}x${h}@${fps}Hz position $right 0"
 }

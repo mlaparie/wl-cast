@@ -2087,8 +2087,10 @@ class Screen:
         # Upright and unscaled whatever the panel's settings, and a custom
         # mode at 60 Hz: with "resolution" Sway gave it a refresh of 0, it
         # never redrew, and the capture's first frame never came, which
-        # held the portal's capture for good (2026-11-19).
-        for command in (f"output {self.name} transform normal scale 1",
+        # held the portal's capture for good (2026-11-19).  Powered on
+        # first: born off, it ignored the mode (2026-11-27).
+        for command in (f"output {self.name} power on",
+                        f"output {self.name} transform normal scale 1",
                         f"output {self.name} mode --custom {width}x{height}@60Hz "
                         f"position {right} 0"):
             subprocess.run(["swaymsg", "--", command], capture_output=True, timeout=5)
