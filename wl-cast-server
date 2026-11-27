@@ -395,7 +395,10 @@ function vp8IfNothing(pc, reload) {
 }
 const withKey = path =>
   key ? path + (path.includes("?") ? "&" : "?") + "k=" + encodeURIComponent(key) : path;
-const cfg = Object.assign({smooth: 50, av: 0, rate: 6, fps: 30, heat: 70, sound: true, input: "touch", steady: false, sync: false, adaptive: true, wifi_awake: true,
+// 15 fps and 5 Mbit/s unless chosen (SET, -f, -b): half the frames of 30
+// for the encoder, the GPU, the server and the Wi-Fi, and what Tesor
+// streams to cars by default (2026-11-27).
+const cfg = Object.assign({smooth: 50, av: 0, rate: 5, fps: 15, heat: 70, sound: true, input: "touch", steady: false, sync: false, adaptive: true, wifi_awake: true,
                            canvas: false, direct: false, folded: false, low: false}, store.get("settings", {}));
 if (P.get("mode")) {
   cfg.canvas = P.get("mode") === "canvas";
@@ -4461,7 +4464,7 @@ class Handler(BaseHTTPRequestHandler):
     size = ""
     target = 0        # the capture rate chosen (the heat limit may hold it lower)
     key = ""          # --key: every request carries it as ?k=
-    mbps = 6.0        # the encoder's bit rate, from the page
+    mbps = 5.0        # the encoder's bit rate, from the page (SET), else 5
 
     # --visibility hotspot: only the phone's hotspot (and the phone itself);
     # usb: only a computer on a USB cable (USB networking), and the host.
