@@ -166,7 +166,7 @@ static EGLContext ctx;
 static PFNEGLCREATEIMAGEKHRPROC create_image;
 static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC image_target;
 static GLuint prog_y, prog_uv, vbo;
-static GLint uni_turn_y, uni_turn_uv, uni_flip_y, uni_flip_uv, uni_px_uv;
+static GLint uni_turn_y, uni_turn_uv, uni_flip_y, uni_flip_uv;
 
 static GLuint shader(GLenum type, const char *src)
 {
@@ -213,11 +213,15 @@ static const char *vertex_src =
 static const char *y_src = SAMPLE
 	"void main() { vec3 c = at(uv);\n"
 	"  gl_FragColor = vec4(dot(c, vec3(0.1826, 0.6142, 0.0620)) + 0.0625, 0.0, 0.0, 1.0); }\n";
+/* One bilinear tap at the centre of the 2x2 block of stream pixels: the
+ * texture's own filter averages the four source texels around it, where
+ * the first version took four taps, each itself bilinear (16 texels read
+ * for every chroma sample; the UV pass cost as much as the Y pass).  At
+ * the stream's own size this is the block's exact mean; scaled down, the
+ * middle of the block. */
 static const char *uv_src = SAMPLE
-	"uniform vec2 px;\n"     /* one stream pixel, in uv */
 	"void main() {\n"
-	"  vec3 c = 0.25 * (at(uv + vec2(-0.5, -0.5) * px) + at(uv + vec2(0.5, -0.5) * px)\n"
-	"                 + at(uv + vec2(-0.5, 0.5) * px) + at(uv + vec2(0.5, 0.5) * px));\n"
+	"  vec3 c = at(uv);\n"
 	"  float u = dot(c, vec3(-0.1006, -0.3386, 0.4392)) + 0.5;\n"
 	"  float v = dot(c, vec3(0.4392, -0.3989, -0.0403)) + 0.5;\n"
 	"  gl_FragColor = vec4(u, v, 0.0, 1.0); }\n";
@@ -262,7 +266,6 @@ static void gl_setup(void)
 	image_target = (void *)eglGetProcAddress("glEGLImageTargetTexture2DOES");
 	prog_y = program(y_src, &uni_turn_y, &uni_flip_y);
 	prog_uv = program(uv_src, &uni_turn_uv, &uni_flip_uv);
-	uni_px_uv = glGetUniformLocation(prog_uv, "px");
 	static const GLfloat quad[] = { -1, -1, 1, -1, -1, 1, 1, 1 };
 	glGenBuffers(1, &vbo);
 	glBindBuffer(GL_ARRAY_BUFFER, vbo);
@@ -664,8 +667,6 @@ static void encode_ready(void)
 	draw(prog_y, uni_turn_y, uni_flip_y, s, turn);
 	glBindFramebuffer(GL_FRAMEBUFFER, outs[o].fb_uv);
 	glViewport(0, 0, W / 2, H / 2);
-	glUseProgram(prog_uv);
-	glUniform2f(uni_px_uv, 1.0f / W, 1.0f / H);
 	draw(prog_uv, uni_turn_uv, uni_flip_uv, s, turn);
 	/* V4L2 does not wait for the GPU: finished before Venus reads. */
 	glFinish();
